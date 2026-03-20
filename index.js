@@ -16,7 +16,7 @@ const { Client } = require('discord-rpc');
 const HTTP_PORT = 8765;
 const CLOCK_SYNC_URL = 'https://worldtimeapi.org/api/timezone/Etc/UTC';
 const CLOCK_SYNC_INTERVAL_MS = 5 * 60 * 1000; // сверка часов раз в 5 минут
-const DEFAULT_CLIENT_ID = '1475270523733807104';
+const DEFAULT_CLIENT_ID = 'Задай свой Client_ID';
 const IDLE_CLEAR_MS = 60 * 1000; // через минуту без обновлений — сбрасываем статус
 const DISCORD_UPDATE_INTERVAL_MS = 500; // обновление раз в 0.5 сек; зелёный таймер = время трека
 

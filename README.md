@@ -38,12 +38,8 @@ npm install
 npm start
 ```
 
-Если используешь свой Client ID:
-
 - Либо в коде в `index.js` замени `CLIENT_ID` на свой Application ID.
-- Либо задай переменную окружения:  
-  `set DISCORD_RPC_CLIENT_ID=твой_application_id` (Windows)  
-  и затем `npm start`.
+- И затем `npm start`.
 
 В консоли должно появиться что-то вроде:
 

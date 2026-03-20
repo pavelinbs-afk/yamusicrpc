@@ -1,0 +1,17 @@
+{
+  "name": "yandex-music-discord-rpc",
+  "version": "1.0.0",
+  "description": "Показывает в Discord, что слушаешь в Яндекс.Музыке",
+  "main": "index.js",
+  "scripts": {
+    "rpc": "node index.js",
+    "start": "npm run start:tray",
+    "run": "node index.js",
+    "postinstall": "node scripts/patch-discord-rpc.js",
+    "start:tray": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tray2.ps1"
+  },
+  "dependencies": {
+    "discord-rpc": "^3.2.0",
+    "ws": "^8.18.0"
+  }
+}

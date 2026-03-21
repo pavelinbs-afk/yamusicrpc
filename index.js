@@ -373,9 +373,11 @@ async function setActivity(track, timestamps) {
     if (trackUrl) {
       // На разных версиях библиотеки поддерживаются разные форматы.
       // Поэтому кладём оба, чтобы кнопка отобразилась в Discord.
-      payload.buttons = [{ label: 'Слушать трек', url: trackUrl }];
-      payload.button1_label = 'Слушать трек';
+      payload.buttons = [{ label: '🎵 Слушать трек', url: trackUrl, label: 'Яндекс Мод' }];
+      payload.button1_label = '🎵 Слушать трек';
       payload.button1_url = trackUrl;
+      payload.button2_label = 'Яндекс Мод';
+      payload.button2_url = 'https://github.com/pavelinbs-afk/yamusicrpc';
       if (trackUrl !== lastSentButtonUrl) {
         log('Кнопка в Discord:', trackUrl);
         lastSentButtonUrl = trackUrl;
@@ -403,8 +405,8 @@ async function setPausedActivity(track) {
       largeImageText: 'Яндекс.Музыка',
     };
     if (trackUrl) {
-      payload.buttons = [{ label: 'Слушать трек', url: trackUrl }];
-      payload.button1_label = 'Слушать трек';
+      payload.buttons = [{ label: '🎵 Слушать трек', url: trackUrl }];
+      payload.button1_label = '🎵 Слушать трек';
       payload.button1_url = trackUrl;
       if (trackUrl !== lastSentButtonUrl) {
         log('Кнопка в Discord:', trackUrl);

@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Discord · Яндекс.Музыка</title>
+  <style>
+    :root {
+      --bg: #0e0e10;
+      --panel: #1a1a1f;
+      --border: #2a2a32;
+      --text: #f2f2f4;
+      --muted: #9aa0aa;
+      --accent: #5865f2;
+      --sidebar: #121216;
+      --font: system-ui, "Segoe UI", sans-serif;
+      --font-size: 14px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--font);
+      font-size: var(--font-size);
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    #app-bar {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      -webkit-app-region: drag;
+    }
+    #app-bar .rpc-badge,
+    #app-bar .bar-btn {
+      -webkit-app-region: no-drag;
+    }
+    .rpc-badge {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: var(--accent);
+      color: #fff;
+    }
+    .bar-track {
+      flex: 1;
+      min-width: 0;
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .bar-btn {
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      padding: 6px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+      font-size: 13px;
+    }
+    .bar-close {
+      padding: 2px 10px;
+      font-size: 20px;
+      line-height: 1;
+    }
+    #settings-shell {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .settings-hidden {
+      display: none !important;
+    }
+    .layout-inner {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      overflow: hidden;
+    }
+    aside {
+      width: 200px;
+      background: var(--sidebar);
+      border-right: 1px solid var(--border);
+      padding: 14px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    aside h1 {
+      font-size: 13px;
+      margin: 0 0 10px;
+      font-weight: 600;
+      color: var(--muted);
+      letter-spacing: 0.02em;
+    }
+    aside button {
+      text-align: left;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text);
+      padding: 8px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+    }
+    aside button:hover { background: rgba(255,255,255,.06); }
+    aside button.active {
+      background: rgba(88,101,242,.18);
+      border-color: rgba(88,101,242,.35);
+    }
+    main {
+      flex: 1;
+      overflow: auto;
+      padding: 18px 20px 24px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      margin-bottom: 12px;
+    }
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 15px;
+    }
+    label.row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 8px 0;
+      font-size: 13px;
+    }
+    label.row span { flex: 1; color: var(--muted); }
+    label.row-toggle {
+      align-items: center;
+      padding: 12px 0;
+      min-height: 48px;
+    }
+    label.row-toggle span {
+      flex: 1;
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 600;
+    }
+    input.checkbox-lg {
+      width: 26px;
+      height: 26px;
+      min-width: 26px;
+      min-height: 26px;
+      flex-shrink: 0;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    input[type="text"], input[type="url"], input[type="number"], select {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #111116;
+      color: var(--text);
+      font: inherit;
+    }
+    .actions { margin-top: 12px; display: flex; gap: 10px; flex-wrap: wrap; }
+    button.primary {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 9px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+    }
+    button.ghost {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 9px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+    }
+    .status { font-size: 13px; color: var(--muted); line-height: 1.5; }
+    .status strong { color: var(--text); }
+    .hidden { display: none !important; }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.4; }
+    pre.logs {
+      max-height: 180px;
+      overflow: auto;
+      background: #111116;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+      font-size: 11px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .panel h3 {
+      margin: 16px 0 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+  </style>
+</head>
+<body>
+  <header id="app-bar">
+    <span class="rpc-badge">RPC</span>
+    <div class="bar-track" id="bar-track-line">Нет трека</div>
+    <button type="button" class="bar-btn" id="btn-toggle-settings">Настройки</button>
+    <button type="button" class="bar-btn bar-close" id="btn-close-app" title="Закрыть">×</button>
+  </header>
+  <div id="settings-shell" class="settings-hidden">
+  <div class="layout-inner">
+  <aside>
+    <h1>Меню</h1>
+    <button type="button" data-section="status" class="active">Статус</button>
+    <button type="button" data-section="discord">Discord</button>
+    <button type="button" data-section="source">Источник</button>
+    <button type="button" data-section="look">Внешний вид</button>
+    <button type="button" data-section="logs">Логи</button>
+  </aside>
+  <main>
+    <section id="sec-status" class="panel">
+      <h2>Статус</h2>
+      <p class="hint" style="margin:0 0 10px">
+        Верхняя полоска: <strong>RPC</strong> и текущий трек. Кнопка <strong>«Настройки»</strong> открывает эту панель в том же окне. Трек берётся из <strong>десктопного клиента</strong> Яндекс.Музыки (Windows). Запустите клиент и включите воспроизведение.
+      </p>
+      <div class="status" id="status-text">Загрузка…</div>
+      <div class="actions">
+        <button type="button" class="ghost" id="btn-refresh">Обновить</button>
+      </div>
+    </section>
+
+    <section id="sec-discord" class="panel hidden">
+      <h2>Интеграция Discord</h2>
+      <p class="hint" style="margin-top:0">
+        Идентификатор приложения встроен. Свой Application ID — переменная <code>DISCORD_RPC_CLIENT_ID</code>.
+      </p>
+
+      <label class="row row-toggle">
+        <span>Включить интеграцию</span>
+        <input type="checkbox" class="checkbox-lg" id="rpc-enabled" />
+      </label>
+      <p class="hint">
+        Статус «Слушает…», обложка и таймер. При отключении активность в Discord сбрасывается.
+      </p>
+
+      <label class="row row-toggle" style="margin-top:16px">
+        <span>Вторая кнопка (ссылка на мод)</span>
+        <input type="checkbox" class="checkbox-lg" id="discord-show-mod-btn" />
+      </label>
+      <p class="hint">
+        Вторая кнопка в Discord ведёт на фиксированный адрес из приложения. Если выключить, остаётся только кнопка открытия трека.
+      </p>
+    </section>
+
+    <section id="sec-source" class="panel hidden">
+      <h2>Источник трека</h2>
+      <p class="hint" style="margin-top:0">
+        Трек и исполнитель берутся из <strong>заголовка окна</strong> официального приложения Яндекс.Музыки (Windows). Веб-версия и встроенный браузер не используются.
+      </p>
+      <label class="row" style="margin-top:12px">
+        <span>Опрос окна десктопа (Windows)</span>
+        <input type="checkbox" id="desktop-poll" />
+      </label>
+      <p class="hint">
+        Если опрос выключен, статус из клиента не подхватится. Для обложек в Discord по-прежнему нужен трек из клиента; отдельной обложки из заголовка окна нет — используется иконка приложения в Discord.
+      </p>
+      <label class="row" style="margin-top:12px"><span>Оценка длительности трека для таймбара (сек)</span></label>
+      <input type="number" id="desktop-assume-sec" min="0" max="3600" placeholder="210" />
+      <p class="hint">Клиент Windows не сообщает длину трека — для зелёной полосы в Discord берётся это число (по умолчанию ~3,5 мин). Поставьте 0, если полоса не нужна.</p>
+      <div class="actions">
+        <button type="button" class="primary" id="btn-save-source">Сохранить</button>
+      </div>
+    </section>
+
+    <section id="sec-look" class="panel hidden">
+      <h2>Внешний вид панели</h2>
+      <label class="row"><span>Тема</span></label>
+      <select id="theme">
+        <option value="dark">Тёмная</option>
+        <option value="light">Светлая</option>
+      </select>
+      <label class="row" style="margin-top:10px"><span>Шрифт (CSS)</span></label>
+      <input type="text" id="font-family" placeholder='system-ui, "Segoe UI", sans-serif' />
+      <label class="row" style="margin-top:10px"><span>Размер (px)</span></label>
+      <input type="number" id="font-size" min="10" max="22" />
+      <label class="row" style="margin-top:10px">
+        <span>Обложки в Discord</span>
+        <input type="checkbox" id="cover-art" />
+      </label>
+      <p class="hint">Для десктопного клиента обложки по URL недоступны — в Discord показывается запасной asset.</p>
+      <div class="actions">
+        <button type="button" class="primary" id="btn-save-look">Сохранить</button>
+      </div>
+    </section>
+
+    <section id="sec-logs" class="panel hidden">
+      <h2>Логи</h2>
+      <label class="row"><span>Режим</span></label>
+      <select id="log-mode">
+        <option value="none">Только в памяти (файлов на диске нет)</option>
+        <option value="file">Файл в папке logs проекта</option>
+        <option value="remote">Отправка на URL</option>
+        <option value="both">Файл + URL</option>
+      </select>
+      <label class="row" style="margin-top:10px"><span>URL для POST (ошибки/события)</span></label>
+      <input type="url" id="log-remote" placeholder="https://example.com/rpc-log" />
+      <p class="hint">Ниже — последние строки из памяти процесса RPC.</p>
+      <pre class="logs" id="log-view"></pre>
+      <div class="actions">
+        <button type="button" class="primary" id="btn-save-logs">Сохранить</button>
+        <button type="button" class="ghost" id="btn-fetch-logs">Обновить лог</button>
+      </div>
+    </section>
+  </main>
+  </div>
+  </div>
+  <script>
+    const API = 'http://127.0.0.1:8765';
+    const $ = (id) => document.getElementById(id);
+
+    let settingsOpen = false;
+    function setBarExpanded(open) {
+      settingsOpen = open;
+      const shell = document.getElementById('settings-shell');
+      if (shell) shell.classList.toggle('settings-hidden', !open);
+      if (window.ymRpc && window.ymRpc.setWindowExpanded) {
+        window.ymRpc.setWindowExpanded(!!open);
+      }
+    }
+
+    function applyNowPlayingToBar(j) {
+      const el = $('bar-track-line');
+      if (!el || !j || !j.nowPlaying) return;
+      const t = (j.nowPlaying.title || '').trim();
+      const a = (j.nowPlaying.artist || '').trim();
+      if (t && a) el.textContent = t + ' — ' + a;
+      else if (t || a) el.textContent = t || a;
+      else el.textContent = 'Нет трека';
+    }
+
+    async function fetchJsonRetry(url, attempts, delayMs) {
+      let last;
+      for (let i = 0; i < attempts; i++) {
+        try {
+          const r = await fetch(url);
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return await r.json();
+        } catch (e) {
+          last = e;
+          if (i < attempts - 1) await new Promise((res) => setTimeout(res, delayMs));
+        }
+      }
+      throw last;
+    }
+
+    function applyTheme(cfg) {
+      const root = document.documentElement;
+      if (cfg.theme === 'light') {
+        root.style.setProperty('--bg', '#f4f4f6');
+        root.style.setProperty('--panel', '#ffffff');
+        root.style.setProperty('--border', '#d8d8e0');
+        root.style.setProperty('--text', '#121218');
+        root.style.setProperty('--muted', '#5c5f6a');
+        root.style.setProperty('--sidebar', '#ececf2');
+        root.style.setProperty('--accent', '#4752c4');
+      } else {
+        root.style.setProperty('--bg', '#0e0e10');
+        root.style.setProperty('--panel', '#1a1a1f');
+        root.style.setProperty('--border', '#2a2a32');
+        root.style.setProperty('--text', '#f2f2f4');
+        root.style.setProperty('--muted', '#9aa0aa');
+        root.style.setProperty('--sidebar', '#121216');
+        root.style.setProperty('--accent', '#5865f2');
+      }
+      root.style.setProperty('--font', cfg.fontFamily || 'system-ui, sans-serif');
+      root.style.setProperty('--font-size', (cfg.fontSizePx || 14) + 'px');
+    }
+
+    async function fetchStatus() {
+      const el = $('status-text');
+      try {
+        const j = await fetchJsonRetry(API + '/api/status', 8, 250);
+        if (!j.ok) {
+          el.textContent = 'Не удалось связаться с RPC. Перезапустите приложение.';
+          return;
+        }
+        const idSrc = j.discordClientIdSource === 'env' ? 'свой (DISCORD_RPC_CLIENT_ID)' : 'встроенный в проект';
+        el.innerHTML =
+          '<strong>Discord:</strong> ' + (j.discordConnected ? 'подключён' : 'нет соединения') + '<br/>' +
+          '<strong>RPC вкл:</strong> ' + (j.rpcEnabled ? 'да' : 'нет') + '<br/>' +
+          '<strong>Application ID:</strong> ' + idSrc + '<br/>' +
+          '<strong>Порт:</strong> ' + j.port + '<br/>' +
+          '<strong>Конфиг:</strong> ' + (j.configDir || '—');
+        applyNowPlayingToBar(j);
+        try {
+          const jc = await fetchJsonRetry(API + '/api/config', 5, 200);
+          if (jc.ok && jc.config) {
+            applyTheme(jc.config);
+            fillForm(jc.config);
+          }
+        } catch (_) {}
+      } catch (e) {
+        el.textContent =
+          'Нет связи с локальным RPC (порт 8765). Подождите пару секунд и нажмите «Обновить», либо перезапустите приложение. Убедитесь, что не запущена вторая копия процесса.';
+      }
+    }
+
+    function fillForm(cfg) {
+      $('rpc-enabled').checked = cfg.rpcEnabled !== false;
+      $('discord-show-mod-btn').checked = cfg.discordShowModButton !== false;
+      $('desktop-poll').checked = cfg.desktopPollingEnabled !== false;
+      const das = $('desktop-assume-sec');
+      if (das) das.value = cfg.desktopAssumedDurationSec != null ? cfg.desktopAssumedDurationSec : 210;
+      $('theme').value = cfg.theme || 'dark';
+      $('font-family').value = cfg.fontFamily || '';
+      $('font-size').value = cfg.fontSizePx || 14;
+      $('cover-art').checked = cfg.coverArtEnabled !== false;
+      const lm = (cfg.logging && cfg.logging.mode) || 'none';
+      $('log-mode').value = lm;
+      const ru = (cfg.logging && cfg.logging.remoteUrl) || '';
+      $('log-remote').value = ru && ru !== '(указан)' ? ru : '';
+    }
+
+    async function savePartial(patch) {
+      const r = await fetch(API + '/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const j = await r.json();
+      if (j.config) applyTheme(j.config);
+      fetchStatus();
+    }
+
+    async function fetchLogs() {
+      try {
+        const r = await fetch(API + '/api/logs');
+        const j = await r.json();
+        const lines = (j.lines || []).map((x) => x.line || JSON.stringify(x)).join('\n');
+        $('log-view').textContent = lines || '(пусто)';
+      } catch (e) {
+        $('log-view').textContent = String(e);
+      }
+    }
+
+    document.querySelectorAll('aside button[data-section]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('aside button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        const id = 'sec-' + btn.getAttribute('data-section');
+        document.querySelectorAll('main section').forEach((s) => s.classList.add('hidden'));
+        const sec = document.getElementById(id);
+        if (sec) sec.classList.remove('hidden');
+        if (btn.getAttribute('data-section') === 'logs') fetchLogs();
+      });
+    });
+
+    $('btn-refresh').addEventListener('click', fetchStatus);
+    $('btn-toggle-settings').addEventListener('click', () => {
+      setBarExpanded(!settingsOpen);
+    });
+    $('btn-close-app').addEventListener('click', () => {
+      if (window.ymRpc && window.ymRpc.quitApp) window.ymRpc.quitApp();
+    });
+    function saveDiscordToggles() {
+      savePartial({
+        rpcEnabled: $('rpc-enabled').checked,
+        discordShowModButton: $('discord-show-mod-btn').checked,
+      });
+    }
+    $('rpc-enabled').addEventListener('change', saveDiscordToggles);
+    $('discord-show-mod-btn').addEventListener('change', saveDiscordToggles);
+    $('btn-save-source').addEventListener('click', () => {
+      savePartial({
+        preferredSource: 'desktop',
+        desktopPollingEnabled: $('desktop-poll').checked,
+        desktopAssumedDurationSec: Number($('desktop-assume-sec').value) || 0,
+      });
+    });
+    $('btn-save-look').addEventListener('click', () => {
+      savePartial({
+        theme: $('theme').value,
+        fontFamily: $('font-family').value.trim(),
+        fontSizePx: Number($('font-size').value) || 14,
+        coverArtEnabled: $('cover-art').checked,
+      });
+    });
+    $('btn-save-logs').addEventListener('click', () => {
+      savePartial({
+        logging: {
+          mode: $('log-mode').value,
+          remoteUrl: $('log-remote').value.trim(),
+        },
+      });
+    });
+    $('btn-fetch-logs').addEventListener('click', fetchLogs);
+
+    fetchStatus();
+    setInterval(fetchStatus, 8000);
+    setInterval(async () => {
+      try {
+        const r = await fetch(API + '/api/status');
+        const j = await r.json();
+        if (j.ok) applyNowPlayingToBar(j);
+      } catch (_) {}
+    }, 2000);
+
+    if (window.ymRpc && window.ymRpc.setWindowExpanded) {
+      window.ymRpc.setWindowExpanded(false);
+    }
+  </script>
+</body>
+</html>

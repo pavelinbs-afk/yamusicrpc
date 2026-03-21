@@ -27,7 +27,7 @@ $logFile = Join-Path $LogDir 'discord-rpc.log'
 $errLogFile = Join-Path $LogDir 'discord-rpc.err.log'
 $disableFlagFile = Join-Path $LogDir 'rpc.disabled'
 
-# On a fresh app launch (`npm start`) we want RPC to be able to start again.
+# On a fresh app launch we want RPC to be able to start again.
 # `rpc.disabled` can remain from a previous Stop/Exit session, which causes
 # confusing "Discord RPC: запусти программу..." toasts when it skips startup.
 try {
@@ -574,17 +574,17 @@ function Open-Console {
 function Install-Dependencies {
   if ($global:installing) { return }
   $global:installing = $true
-  Write-Log 'npm install requested'
+  Write-Log 'pnpm install requested'
 
   $p = Start-Process `
     -FilePath 'cmd.exe' `
-    -ArgumentList '/c npm install' `
+    -ArgumentList '/c pnpm install' `
     -WorkingDirectory $ProjectDir `
     -WindowStyle Normal `
     -PassThru
 
   Register-ObjectEvent -InputObject $p -EventName Exited -Action {
-    Write-Log "npm install finished (code=$($EventArgs.ExitCode))"
+    Write-Log "pnpm install finished (code=$($EventArgs.ExitCode))"
     $global:installing = $false
     try { Restart-Hidden } catch { Write-Log "Restart after install failed: $($_.Exception.Message)" }
   } | Out-Null
@@ -607,9 +607,9 @@ $global:notifyIcon = $notifyIcon
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 $miConsole = New-Object System.Windows.Forms.ToolStripMenuItem "Open console"
-$miRestart = New-Object System.Windows.Forms.ToolStripMenuItem "Restart (npm run rpc)"
+$miRestart = New-Object System.Windows.Forms.ToolStripMenuItem "Перезапустить RPC"
 $miStop = New-Object System.Windows.Forms.ToolStripMenuItem "Stop RPC"
-$miInstall = New-Object System.Windows.Forms.ToolStripMenuItem "Reinstall deps (npm install)"
+$miInstall = New-Object System.Windows.Forms.ToolStripMenuItem "Reinstall deps (pnpm)"
 $miLog = New-Object System.Windows.Forms.ToolStripMenuItem "Open logs folder"
 $miClearLogs = New-Object System.Windows.Forms.ToolStripMenuItem "Clear logs..."
 $miProj = New-Object System.Windows.Forms.ToolStripMenuItem "Open project folder"

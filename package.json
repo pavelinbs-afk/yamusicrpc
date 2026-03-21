@@ -1,17 +1,77 @@
 {
   "name": "yandex-music-discord-rpc",
-  "version": "1.0.0",
-  "description": "Показывает в Discord, что слушаешь в Яндекс.Музыке",
-  "main": "index.js",
+  "version": "1.4.1",
+  "description": "Официальное приложение RPC для статуса в Discord",
+  "author": "Yandex Music RPC",
+  "main": "electron/main.js",
+  "packageManager": "pnpm@9.15.9",
   "scripts": {
-    "rpc": "node index.js",
-    "start": "npm run start:tray",
-    "run": "node index.js",
+    "app": "electron .",
     "postinstall": "node scripts/patch-discord-rpc.js",
-    "start:tray": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tray2.ps1"
+    "dist": "electron-builder --win --x64",
+    "dist:nomsi": "electron-builder --win nsis portable --x64",
+    "pack": "electron-builder --win --x64 --dir",
+    "dev:rpc": "node index.js"
   },
   "dependencies": {
     "discord-rpc": "^3.2.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^28.3.3",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.yandexmusic.discordrpc",
+    "productName": "Yandex Music RPC",
+    "copyright": "Copyright © Yandex Music RPC",
+    "directories": {
+      "output": "release"
+    },
+    "asarUnpack": [
+      "scripts/**/*.ps1"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "msi",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "runAfterFinish": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Yandex Music RPC",
+      "allowToChangeInstallationDirectory": false,
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable.${ext}"
+    },
+    "msi": {
+      "oneClick": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Yandex Music RPC",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    }
   }
 }

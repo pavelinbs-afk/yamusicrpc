@@ -2,8 +2,10 @@
 'use strict';
 
 /**
- * Программа для отображения в Discord статуса "Слушает ... в Яндекс.Музыке".
- * Принимает данные о треке по HTTP POST от userscript в браузере (обход CSP).
+ * Программа для отображения в Discord статуса «Слушает … в Яндекс.Музыке».
+ * Источник трека по умолчанию — десктопный клиент Windows (заголовок окна, см. scripts/read-yandex-desktop-title.ps1).
+ * HTTP POST /track оставлен для совместимости; в сборке Electron веб-версия не используется.
+ * Discord Application ID встроен (lib/discord-client-id.js), переопределение: DISCORD_RPC_CLIENT_ID.
  */
 
 const http = require('http');
@@ -11,18 +13,32 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
+const { spawn } = require('child_process');
 const { Client } = require('discord-rpc');
+const { loadConfig, saveConfig, getConfigDir } = require('./lib/config');
+const { createLogger } = require('./lib/logging');
+const { resolveDiscordClientId, clientIdSource } = require('./lib/discord-client-id');
+
+/** Заголовок окна нашего Electron-приложения не должен уходить в Discord как название трека. */
+function isRpcAppWindowTitle(t) {
+  if (!t || typeof t !== 'string') return false;
+  const s = t.trim();
+  return /^Yandex\s*Music\s*RPC$/i.test(s) || /^Яндекс\s*Музыка\s*RPC$/i.test(s);
+}
+
+/** Подписи и URL кнопок Rich Presence заданы в приложении, не в настройках. */
+const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Открыть';
+const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Yandex Music Mod';
+const DISCORD_FIXED_MOD_BTN_URL = 'https://github.com/Stephanzion/YandexMusicBetaMod';
 
 const HTTP_PORT = 8765;
 const CLOCK_SYNC_URL = 'https://worldtimeapi.org/api/timezone/Etc/UTC';
 const CLOCK_SYNC_INTERVAL_MS = 5 * 60 * 1000; // сверка часов раз в 5 минут
-const DEFAULT_CLIENT_ID = 'Задай свой Client_ID';
 const IDLE_CLEAR_MS = 60 * 1000; // через минуту без обновлений — сбрасываем статус
 const DISCORD_UPDATE_INTERVAL_MS = 500; // обновление раз в 0.5 сек; зелёный таймер = время трека
 
 let rpc = null;
 let idleTimer = null;
-let browserEverConnected = false;
 let currentTrackKey = null;
 let currentTrackStart = null;
 let currentTrackDurationSec = null; // фиксируем длительность трека один раз при старте
@@ -34,15 +50,35 @@ let hasLoggedFirstMsg = false;
 let clockOffsetMs = 0;
 let suppressUntilMs = 0;
 let discordReconnectInProgress = false;
+/** Для корректного выхода при встраивании в Electron (без второго процесса). */
+let rpcShutdownStarted = false;
+let lastBrowserPostAt = 0;
+let lastDesktopTrackKey = null;
+/** Для полоски RPC в окне Electron */
+let lastNowPlaying = { title: '', artist: '' };
 
 const LOG_DIR = path.join(__dirname, 'logs');
 const LOG_PATH = path.join(LOG_DIR, 'discord-rpc.log');
 const ERR_LOG_PATH = path.join(LOG_DIR, 'discord-rpc.err.log');
 const SERVER_LOCK_PATH = path.join(LOG_DIR, 'server.lock');
-const DISCORD_CLIENT_ID_FILE = path.join(LOG_DIR, 'discord-client-id.txt');
 try {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 } catch (_) {}
+
+let runtimeConfig = loadConfig();
+const loggerApi = createLogger({ logPath: LOG_PATH, errLogPath: ERR_LOG_PATH });
+function log(...args) {
+  loggerApi.log(runtimeConfig, ...args);
+}
+function logErr(...args) {
+  loggerApi.logErr(runtimeConfig, ...args);
+}
+function getMemoryLogSnapshot() {
+  return loggerApi.getMemoryLines();
+}
+function reloadRuntimeConfig() {
+  runtimeConfig = loadConfig();
+}
 
 function isProcessAlive(pid) {
   if (!pid || !Number.isFinite(pid)) return false;
@@ -55,30 +91,7 @@ function isProcessAlive(pid) {
   }
 }
 
-function resolveClientId() {
-  try {
-    const envId = process.env.DISCORD_RPC_CLIENT_ID;
-    if (envId && typeof envId === 'string' && envId.trim()) return envId.trim();
-  } catch (_) {}
-  try {
-    if (fs.existsSync(DISCORD_CLIENT_ID_FILE)) {
-      const v = fs.readFileSync(DISCORD_CLIENT_ID_FILE, 'utf8').trim();
-      if (v) return v;
-    }
-  } catch (_) {}
-  try {
-    // fallback for convenient manual config
-    const alt = path.join(__dirname, 'discord-client-id.txt');
-    if (fs.existsSync(alt)) {
-      const v2 = fs.readFileSync(alt, 'utf8').trim();
-      if (v2) return v2;
-    }
-  } catch (_) {}
-  return DEFAULT_CLIENT_ID;
-}
-
-const CLIENT_ID = resolveClientId();
-const CLIENT_ID_IS_DEFAULT = CLIENT_ID === DEFAULT_CLIENT_ID;
+const CLIENT_ID = resolveDiscordClientId();
 
 function isPortListening(port, host = '127.0.0.1', timeoutMs = 250) {
   return new Promise((resolve) => {
@@ -125,13 +138,28 @@ async function checkDiscordIpcPipes(maxId = 10) {
 
 async function tryAcquireServerLock() {
   try {
+    // Внутри Electron уже есть single-instance; не даём «чужому» server.lock
+    // прервать main() до runHttpServer() — иначе порт 8765 не поднимается и UI пустой.
+    if (process.env.RPC_EMBEDDED_IN_ELECTRON === '1') {
+      try {
+        fs.mkdirSync(LOG_DIR, { recursive: true });
+      } catch (_) {}
+      fs.writeFileSync(SERVER_LOCK_PATH, String(process.pid), 'utf8');
+      process.on('exit', () => {
+        try {
+          const raw = fs.readFileSync(SERVER_LOCK_PATH, 'utf8').trim();
+          if (Number(raw) === process.pid) fs.unlinkSync(SERVER_LOCK_PATH);
+        } catch (_) {}
+      });
+      return true;
+    }
+
     let existingPid = null;
     if (fs.existsSync(SERVER_LOCK_PATH)) {
       const raw = fs.readFileSync(SERVER_LOCK_PATH, 'utf8').trim();
       const pid = Number(raw);
       existingPid = Number.isFinite(pid) ? pid : null;
       if (existingPid && isProcessAlive(existingPid)) {
-        // PID might be reused; use port listening as authoritative signal.
         const listening = await isPortListening(HTTP_PORT);
         if (listening) {
           log('server.lock: another instance seems alive (pid=', existingPid, '), exiting.');
@@ -148,9 +176,10 @@ async function tryAcquireServerLock() {
         if (Number(raw) === process.pid) fs.unlinkSync(SERVER_LOCK_PATH);
       } catch (_) {}
     });
-    process.on('SIGINT', () => process.exit(0));
-    process.on('SIGTERM', () => process.exit(0));
-  } catch (_) {}
+    return true;
+  } catch (_) {
+    return true;
+  }
 }
 
 function rotateLogFile(filePath, kind) {
@@ -222,7 +251,9 @@ function archiveAndCleanupLogsOnExit(keepLatest = 15) {
   } catch (_) {}
 }
 
-function initLogFiles() {
+function initLogFilesIfNeeded() {
+  const mode = runtimeConfig.logging && runtimeConfig.logging.mode;
+  if (mode !== 'file' && mode !== 'both') return;
   try {
     rotateLogFile(LOG_PATH, 'utf8');
     rotateLogFile(ERR_LOG_PATH, 'utf8');
@@ -234,30 +265,9 @@ function initLogFiles() {
   } catch (_) {}
 }
 
-initLogFiles();
-
 process.on('exit', () => {
   try { archiveAndCleanupLogsOnExit(15); } catch {}
 });
-
-function log(...args) {
-  const time = new Date().toLocaleTimeString('ru-RU');
-  const line = `[${time}] ${args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}`;
-  // Логи в файл (UTF-8), чтобы не было "кракозябр" при редиректе консоли.
-  try {
-    fs.appendFileSync(LOG_PATH, line + '\n', { encoding: 'utf8' });
-  } catch (_) {}
-  console.log(line);
-}
-
-function logErr(...args) {
-  const time = new Date().toLocaleTimeString('ru-RU');
-  const line = `[${time}] ERR ${args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}`;
-  try {
-    fs.appendFileSync(ERR_LOG_PATH, line + '\n', { encoding: 'utf8' });
-  } catch (_) {}
-  console.error(line);
-}
 
 process.on('uncaughtException', (err) => {
   logErr('uncaughtException', err && err.stack ? err.stack : String(err));
@@ -328,8 +338,56 @@ function normalizeTrackUrl(rawUrl) {
   return `https://music.yandex.ru/${u.replace(/^\/+/, '')}`;
 }
 
+function isAllowedCoverUrl(u) {
+  if (!u || typeof u !== 'string') return false;
+  try {
+    const url = new URL(u);
+    if (url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    return (
+      host.endsWith('yandex.ru') ||
+      host.endsWith('yandex.net') ||
+      host.endsWith('yandex.com') ||
+      host.endsWith('yandex.by') ||
+      host.endsWith('yandex.kz')
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+function pickLargeImage(track) {
+  const cover = track && track.coverUrl;
+  if (runtimeConfig.coverArtEnabled && cover && isAllowedCoverUrl(cover)) {
+    const text = (track.album || track.title || 'Яндекс.Музыка').slice(0, 128);
+    return { key: cover.slice(0, 512), text };
+  }
+  return { key: 'yandex_music_icon', text: 'Яндекс.Музыка' };
+}
+
+function applyDiscordButtonsToPayload(payload, trackUrl) {
+  if (!trackUrl) return;
+  const cfg = runtimeConfig;
+  const label1 = DISCORD_FIXED_TRACK_BTN_LABEL.slice(0, 32);
+  const buttons = [{ label: label1, url: trackUrl }];
+  if (cfg.discordShowModButton !== false) {
+    const l2 = DISCORD_FIXED_MOD_BTN_LABEL.slice(0, 32);
+    const u2 = DISCORD_FIXED_MOD_BTN_URL.trim();
+    if (u2 && /^https?:\/\//i.test(u2)) {
+      buttons.push({ label: l2, url: u2 });
+    }
+  }
+  payload.buttons = buttons;
+  payload.button1_label = buttons[0].label;
+  payload.button1_url = buttons[0].url;
+  if (buttons[1]) {
+    payload.button2_label = buttons[1].label;
+    payload.button2_url = buttons[1].url;
+  }
+}
+
 async function setActivity(track, timestamps) {
-  if (!rpc) return;
+  if (!rpc || !runtimeConfig.rpcEnabled) return;
   const { title = '', artist = '', album = '', url: trackUrl, positionSec, durationSec } = track;
 
   const p = typeof positionSec === 'number' && Number.isFinite(positionSec) ? Math.max(0, positionSec) : 0;
@@ -357,6 +415,7 @@ async function setActivity(track, timestamps) {
     // Коррекция по UTC, чтобы у зрителей (другие ПК) тайм-бар совпадал с реальным воспроизведением
     const startAdjusted = startedAtMs - clockOffsetMs;
     const endAdjusted = endsAtMs != null ? endsAtMs - clockOffsetMs : undefined;
+    const img = pickLargeImage(track);
     const payload = {
       details,
       state,
@@ -365,19 +424,12 @@ async function setActivity(track, timestamps) {
       type: 2,
       startTimestamp: new Date(startAdjusted),
       endTimestamp: endAdjusted != null && Number.isFinite(endAdjusted) ? new Date(endAdjusted) : undefined,
-      largeImageKey: 'yandex_music_icon',
-      largeImageText: 'Яндекс.Музыка',
+      largeImageKey: img.key,
+      largeImageText: img.text,
     };
     log('DEBUG payload type:', payload.type, 'endTimestamp?', !!payload.endTimestamp, 'startAdjusted=', Math.round(startAdjusted / 1000));
-    // discord-rpc@4.x ожидает поля для кнопок в формате button1_label/button1_url
     if (trackUrl) {
-      // На разных версиях библиотеки поддерживаются разные форматы.
-      // Поэтому кладём оба, чтобы кнопка отобразилась в Discord.
-      payload.buttons = [{ label: '🎵 Слушать трек', url: trackUrl, label: 'Яндекс Мод' }];
-      payload.button1_label = '🎵 Слушать трек';
-      payload.button1_url = trackUrl;
-      payload.button2_label = 'Яндекс Мод';
-      payload.button2_url = 'https://github.com/pavelinbs-afk/yamusicrpc';
+      applyDiscordButtonsToPayload(payload, trackUrl);
       if (trackUrl !== lastSentButtonUrl) {
         log('Кнопка в Discord:', trackUrl);
         lastSentButtonUrl = trackUrl;
@@ -392,22 +444,21 @@ async function setActivity(track, timestamps) {
 }
 
 async function setPausedActivity(track) {
-  if (!rpc) return;
+  if (!rpc || !runtimeConfig.rpcEnabled) return;
   const { title = '', artist = '', positionSec, durationSec, url: trackUrl } = track;
   const mainLine = [title || '', artist || ''].filter(Boolean).join(' — ');
   const stateText = (mainLine || 'Яндекс.Музыка').slice(0, 128);
   try {
+    const img = pickLargeImage(track);
     const payload = {
       details: 'Приостановлено в Яндекс Музыке',
       state: stateText,
       type: 2,
-      largeImageKey: 'yandex_music_icon',
-      largeImageText: 'Яндекс.Музыка',
+      largeImageKey: img.key,
+      largeImageText: img.text,
     };
     if (trackUrl) {
-      payload.buttons = [{ label: '🎵 Слушать трек', url: trackUrl }];
-      payload.button1_label = '🎵 Слушать трек';
-      payload.button1_url = trackUrl;
+      applyDiscordButtonsToPayload(payload, trackUrl);
       if (trackUrl !== lastSentButtonUrl) {
         log('Кнопка в Discord:', trackUrl);
         lastSentButtonUrl = trackUrl;
@@ -514,11 +565,145 @@ function startDiscordReconnectLoop() {
     });
 }
 
+function publicConfigSnapshot() {
+  const c = JSON.parse(JSON.stringify(runtimeConfig));
+  if (c.logging && c.logging.remoteUrl) {
+    c.logging.remoteUrl = '(указан)';
+  }
+  delete c.discordTrackButtonLabel;
+  delete c.discordModButtonLabel;
+  delete c.discordModButtonUrl;
+  return c;
+}
+
+function mergeConfigPatch(patch) {
+  const base = loadConfig();
+  const p = { ...patch };
+  delete p.discordTrackButtonLabel;
+  delete p.discordModButtonLabel;
+  delete p.discordModButtonUrl;
+  const out = { ...base, ...p };
+  if (p.logging && typeof p.logging === 'object') {
+    out.logging = { ...base.logging, ...p.logging };
+  }
+  return out;
+}
+
+function getPsScriptPath() {
+  if (process.env.RPC_SCRIPTS_DIR) {
+    const p = path.join(process.env.RPC_SCRIPTS_DIR, 'read-yandex-desktop-title.ps1');
+    if (fs.existsSync(p)) return p;
+  }
+  const rel = path.join(__dirname, 'scripts', 'read-yandex-desktop-title.ps1');
+  const unpacked = rel.replace(/app\.asar([\\/])/g, 'app.asar.unpacked$1');
+  if (fs.existsSync(unpacked)) return unpacked;
+  return rel;
+}
+
+function desktopPollOnce() {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') return resolve(null);
+    const scriptPath = getPsScriptPath();
+    if (!fs.existsSync(scriptPath)) return resolve(null);
+    const ps = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      { windowsHide: true },
+    );
+    let out = '';
+    ps.stdout.on('data', (d) => { out += d.toString('utf8'); });
+    ps.stderr.on('data', () => {});
+    ps.on('close', () => {
+      try {
+        const line = out.trim().split(/\r?\n/).filter(Boolean).pop();
+        if (!line) return resolve(null);
+        resolve(JSON.parse(line));
+      } catch (_) {
+        resolve(null);
+      }
+    });
+    ps.on('error', () => resolve(null));
+  });
+}
+
+function postLocalTrackJson(payload) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify(payload);
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: HTTP_PORT,
+        path: '/track',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body, 'utf8'),
+        },
+      },
+      (r) => {
+        try {
+          r.resume();
+        } catch (_) {}
+        resolve();
+      },
+    );
+    req.on('error', () => resolve());
+    req.write(body);
+    req.end();
+  });
+}
+
+function startDesktopPoller() {
+  let busy = false;
+  const tick = async () => {
+    if (busy) return;
+    if (!runtimeConfig.desktopPollingEnabled || process.platform !== 'win32') return;
+    if (runtimeConfig.preferredSource === 'browser') return;
+    busy = true;
+    try {
+      const data = await desktopPollOnce();
+      const browserFresh = Date.now() - lastBrowserPostAt < runtimeConfig.desktopBrowserPriorityMs;
+      const shouldOwnDesktop =
+        runtimeConfig.preferredSource === 'desktop' ||
+        (runtimeConfig.preferredSource === 'auto' && !browserFresh);
+      if (!data || !data.ok) {
+        if (shouldOwnDesktop && lastDesktopTrackKey) {
+          lastDesktopTrackKey = null;
+          await postLocalTrackJson({ clear: true, source: 'desktop' });
+        }
+        return;
+      }
+      if (runtimeConfig.preferredSource === 'auto' && browserFresh) {
+        return;
+      }
+      if (isRpcAppWindowTitle(data.title)) {
+        if (lastDesktopTrackKey) {
+          lastDesktopTrackKey = null;
+          await postLocalTrackJson({ clear: true, source: 'desktop' });
+        }
+        return;
+      }
+      const key = `${data.title} — ${data.artist || ''}`.trim();
+      lastDesktopTrackKey = key;
+      await postLocalTrackJson({
+        title: data.title,
+        artist: data.artist || '',
+        source: 'desktop',
+        paused: false,
+      });
+    } finally {
+      busy = false;
+    }
+  };
+  setInterval(tick, 2000);
+  setTimeout(tick, 1200);
+}
+
 function runHttpServer() {
   const server = http.createServer((req, res) => {
     const cors = {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
     };
     if (req.method === 'OPTIONS') {
@@ -542,6 +727,53 @@ function runHttpServer() {
       })();
       return;
     }
+    if (req.method === 'GET' && req.url === '/api/status') {
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        rpcEnabled: runtimeConfig.rpcEnabled,
+        discordConnected: !!rpc,
+        port: HTTP_PORT,
+        preferredSource: runtimeConfig.preferredSource,
+        discordClientIdSource: clientIdSource(),
+        config: publicConfigSnapshot(),
+        configDir: getConfigDir(),
+        nowPlaying: lastNowPlaying,
+      }));
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/api/config') {
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, config: runtimeConfig }));
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/api/logs') {
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, lines: getMemoryLogSnapshot() }));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/api/config') {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const patch = JSON.parse(body || '{}');
+          const merged = mergeConfigPatch(patch);
+          saveConfig(merged);
+          reloadRuntimeConfig();
+          initLogFilesIfNeeded();
+          if (!runtimeConfig.rpcEnabled) {
+            await clearActivity();
+          }
+          res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, config: publicConfigSnapshot() }));
+        } catch (e) {
+          res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) }));
+        }
+      });
+      return;
+    }
     if (req.method !== 'POST' || req.url !== '/track') {
       res.writeHead(404, { ...cors, 'Content-Type': 'text/plain' });
       res.end('Not found');
@@ -552,7 +784,6 @@ function runHttpServer() {
     req.on('end', async () => {
       try {
         const msg = JSON.parse(body || '{}');
-        browserEverConnected = true;
         if (!hasLoggedFirstMsg && (msg && (msg.title !== undefined || msg.artist !== undefined || msg.paused))) {
           hasLoggedFirstMsg = true;
           log(
@@ -564,7 +795,8 @@ function runHttpServer() {
         }
         if (msg.clear) {
           log('HTTP clear received');
-          suppressUntilMs = Date.now() + 15000; // после clear игнорируем обновления короткое время
+          suppressUntilMs = msg.source === 'desktop' ? 0 : Date.now() + 15000;
+          lastNowPlaying = { title: '', artist: '' };
           await clearActivity();
           clearIdleTimer();
           currentTrackKey = null;
@@ -592,13 +824,53 @@ function runHttpServer() {
             res.end(JSON.stringify({ ok: true, ignored: true }));
             return;
           }
+          const src = msg.source || 'browser';
+          if (src === 'browser' || src === 'web') {
+            lastBrowserPostAt = Date.now();
+          }
+          if (runtimeConfig.preferredSource === 'desktop' && (src === 'browser' || src === 'web')) {
+            res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, ignored: true }));
+            return;
+          }
+          if (runtimeConfig.preferredSource === 'browser' && src === 'desktop') {
+            res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, ignored: true }));
+            return;
+          }
+          if (runtimeConfig.preferredSource === 'auto' && src === 'desktop') {
+            if (Date.now() - lastBrowserPostAt < runtimeConfig.desktopBrowserPriorityMs) {
+              res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, ignored: true }));
+              return;
+            }
+          }
+          if (!runtimeConfig.rpcEnabled) {
+            await clearActivity();
+            res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, rpcDisabled: true }));
+            return;
+          }
           const title = msg.title || '';
           const artist = msg.artist || '';
+          if (msg.source === 'desktop' && isRpcAppWindowTitle(title)) {
+            res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, ignored: true }));
+            return;
+          }
           const album = msg.album || '';
-          const trackUrl = normalizeTrackUrl(msg.url);
+          const coverUrl = typeof msg.coverUrl === 'string' ? msg.coverUrl.trim() : '';
+          let trackUrl = normalizeTrackUrl(msg.url);
+          if (!trackUrl && src === 'desktop') {
+            const q = `${title} ${artist}`.trim();
+            if (q) {
+              trackUrl = `https://music.yandex.ru/search?text=${encodeURIComponent(q)}`;
+            }
+          }
           const key = `${title} — ${artist}`.trim();
 
           if (!key) {
+            lastNowPlaying = { title: '', artist: '' };
             await clearActivity();
             clearIdleTimer();
             currentTrackKey = null;
@@ -609,11 +881,13 @@ function runHttpServer() {
             return;
           }
 
+          lastNowPlaying = { title: title || '', artist: artist || '' };
+
           const now = Date.now();
-          const posSec = typeof msg.positionSec === 'number' && Number.isFinite(msg.positionSec)
+          let posSec = typeof msg.positionSec === 'number' && Number.isFinite(msg.positionSec)
             ? Math.max(0, msg.positionSec)
             : null;
-          const durSec = typeof msg.durationSec === 'number' && Number.isFinite(msg.durationSec)
+          let durSec = typeof msg.durationSec === 'number' && Number.isFinite(msg.durationSec)
             ? Math.max(0, msg.durationSec)
             : null;
 
@@ -655,6 +929,20 @@ function runHttpServer() {
             }
           }
 
+          /* Десктоп не отдаёт позицию/длительность: считаем прошедшее время сами; длительность — из конфига (оценка для таймбара). */
+          if (src === 'desktop') {
+            if (currentTrackStart != null) {
+              posSec = Math.floor((Date.now() - currentTrackStart) / 1000);
+            }
+            const assume = runtimeConfig.desktopAssumedDurationSec;
+            if (assume > 0 && (durSec == null || durSec <= 0)) {
+              durSec = assume;
+              if (currentTrackDurationSec == null) {
+                currentTrackDurationSec = assume;
+              }
+            }
+          }
+
           // для таймера Discord и для текста — длительность; не используем durSec если он <= posSec (ошибка)
           const durSecValid = durSec != null && (posSec == null || durSec > posSec);
           const effectiveDurSec = currentTrackDurationSec != null
@@ -684,6 +972,7 @@ function runHttpServer() {
               title,
               artist,
               album,
+              coverUrl,
               positionSec: posSec,
               durationSec: durationForPauseSec,
               url: trackUrl,
@@ -709,6 +998,7 @@ function runHttpServer() {
                   title,
                   artist,
                   album,
+                  coverUrl,
                   positionSec: elapsedForDisplaySec,
                   durationSec: effectiveDurSec != null ? effectiveDurSec : totalForDisplaySec,
                   url: trackUrl,
@@ -733,86 +1023,82 @@ function runHttpServer() {
   });
 
   log('Starting HTTP server on port', HTTP_PORT);
-  server.listen(HTTP_PORT, () => {
-    log(`HTTP сервер: http://localhost:${HTTP_PORT}/track`);
-    log('Открой Яндекс.Музыку в браузере и установи userscript (см. README).');
+  server.listen(HTTP_PORT, '127.0.0.1', () => {
+    log(`HTTP сервер: http://127.0.0.1:${HTTP_PORT}/track`);
+    log('Десктопный клиент Яндекс.Музыки (Windows): трек из заголовка окна.');
   });
 
   return server;
 }
 
+async function gracefulShutdown(reason, opts = {}) {
+  if (rpcShutdownStarted) return;
+  rpcShutdownStarted = true;
+  log(`Выход (${reason}). Сбрасываю статус в Discord.`);
+  try {
+    if (rpc) {
+      await clearActivity();
+      rpc.destroy();
+    }
+  } catch (e) {
+    log('Ошибка при сбросе статуса:', e.message);
+  }
+  if (process.env.RPC_EMBEDDED_IN_ELECTRON === '1') {
+    if (!opts.fromElectronBeforeQuit) {
+      try {
+        const { app } = require('electron');
+        if (app && typeof app.quit === 'function') app.quit();
+      } catch (_) {}
+    }
+    return;
+  }
+  process.exit(0);
+}
+
 async function main() {
-  await tryAcquireServerLock();
+  const locked = await tryAcquireServerLock();
+  if (locked === false) return;
+  initLogFilesIfNeeded();
   try { await checkDiscordIpcPipes(10); } catch (_) {}
   log('Яндекс.Музыка → Discord RPC');
   try {
-    // Показываем версию установленного discord-rpc, чтобы было понятно
-    // какая библиотека реально запущена после npm install.
     // eslint-disable-next-line global-require
     const vr = require('discord-rpc/package.json')?.version;
     if (vr) log('discord-rpc version:', vr);
   } catch (_) {}
 
-  if (!CLIENT_ID || CLIENT_ID === 'YOUR_DISCORD_APPLICATION_ID') {
-    log('Ошибка: укажи Client ID своего приложения Discord.');
-    log('Создай приложение на https://discord.com/developers/applications и скопируй Application ID.');
-    log('Затем в index.js замени YOUR_DISCORD_APPLICATION_ID или задай переменную DISCORD_RPC_CLIENT_ID.');
-    process.exit(1);
-  }
-  log('Client ID:', CLIENT_ID);
-  if (CLIENT_ID_IS_DEFAULT) {
-    logErr(
-      'WARN: Using DEFAULT_CLIENT_ID. Set your real Application ID in DISCORD_RPC_CLIENT_ID or in yandex-music-rpc/logs/discord-client-id.txt.'
-    );
-  }
-  if (process.env.DISCORD_RPC_CLIENT_ID) {
-    log('(Client ID взят из переменной DISCORD_RPC_CLIENT_ID)');
-  }
+  log('Discord Application ID:', CLIENT_ID, `(${clientIdSource() === 'env' ? 'переменная DISCORD_RPC_CLIENT_ID' : 'встроенный в проект'})`);
 
-  // If we lost a startup race, avoid crashing with EADDRINUSE.
-  if (await isPortListening(HTTP_PORT)) {
-    log('Port', HTTP_PORT, 'is already listening -> exiting to avoid EADDRINUSE.');
-    process.exit(0);
+  if (process.env.RPC_EMBEDDED_IN_ELECTRON !== '1') {
+    if (await isPortListening(HTTP_PORT)) {
+      log('Port', HTTP_PORT, 'is already listening -> exiting to avoid EADDRINUSE.');
+      process.exit(0);
+    }
   }
 
   runHttpServer();
+  startDesktopPoller();
 
-  // Раз в 30 сек напоминаем, что ждём браузер (чтобы в логе было видно, что программа жива)
   setInterval(() => {
-    if (!browserEverConnected) {
-      log('Ожидаю подключения от браузера. Открой music.yandex.ru с установленным скриптом Tampermonkey.');
+    if (!hasLoggedFirstMsg) {
+      log(
+        'Ожидаю трек: запустите приложение Яндекс.Музыки для Windows (не веб-версию) и включите воспроизведение.',
+      );
     }
   }, 30 * 1000);
 
-  let shutdownStarted = false;
-  const gracefulShutdown = (reason) => {
-    if (shutdownStarted) return;
-    shutdownStarted = true;
-    log(`Выход (${reason}). Сбрасываю статус в Discord.`);
-    (async () => {
-      try {
-        if (rpc) {
-          await clearActivity();
-          rpc.destroy();
-        }
-      } catch (e) {
-        log('Ошибка при сбросе статуса:', e.message);
-      } finally {
-        process.exit(0);
-      }
-    })();
-  };
+  process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });
+  process.on('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
+  process.on('SIGBREAK', () => { gracefulShutdown('SIGBREAK'); });
 
-  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.on('SIGBREAK', () => gracefulShutdown('SIGBREAK'));
-
-  // Discord connection can fail sometimes (Discord not ready / restarted).
-  // We must not block HTTP server start, so userscript can still reach /track.
   startDiscordReconnectLoop();
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+module.exports = { main, gracefulShutdown };
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

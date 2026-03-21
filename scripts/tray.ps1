@@ -1,7 +1,7 @@
 param(
   [string]$ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
   [string]$LogDir = (Join-Path $PSScriptRoot '..\\logs'),
-  [string]$NodeCmd = 'npm.cmd'
+  [string]$NodeCmd = 'node'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,7 +55,8 @@ function Start-Node([ValidateSet('Hidden','Normal')] [string]$windowStyle) {
   }
 
   # Запускаем именно RPC (без повторного старта трей-контроллера).
-  $args = @('run', 'rpc')
+  $indexJs = Join-Path $ProjectDir 'index.js'
+  $args = @($indexJs)
   $p = $null
 
   if ($windowStyle -eq 'Hidden') {
@@ -99,19 +100,19 @@ function Install-Dependencies {
   if ($global:installing) { return }
   $global:installing = $true
 
-  Write-Log "npm install requested"
+  Write-Log "pnpm install requested"
 
   # Запускаем установку в отдельном окне (чтобы было видно).
   # После завершения — перезапускаем скрыто.
   $p = Start-Process `
     -FilePath 'cmd.exe' `
-    -ArgumentList "/c npm install" `
+    -ArgumentList "/c pnpm install" `
     -WorkingDirectory $ProjectDir `
     -WindowStyle Normal `
     -PassThru
 
   Register-ObjectEvent -InputObject $p -EventName Exited -Action {
-    Write-Log "npm install finished (code=$($EventArgs.ExitCode))"
+    Write-Log "pnpm install finished (code=$($EventArgs.ExitCode))"
     $global:installing = $false
     try {
       Restart-Hidden
@@ -149,9 +150,9 @@ $notifyIcon.Text = 'Yandex Music RPC (запуск...)'
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 $miConsole = New-Object System.Windows.Forms.ToolStripMenuItem 'Открыть консоль'
-$miRestart = New-Object System.Windows.Forms.ToolStripMenuItem 'Перезапустить (npm run rpc)'
+$miRestart = New-Object System.Windows.Forms.ToolStripMenuItem 'Перезапустить RPC'
 $miStop = New-Object System.Windows.Forms.ToolStripMenuItem 'Остановить RPC'
-$miInstall = New-Object System.Windows.Forms.ToolStripMenuItem 'Переустановить зависимости (npm install)'
+$miInstall = New-Object System.Windows.Forms.ToolStripMenuItem 'Переустановить зависимости (pnpm)'
 $miLog = New-Object System.Windows.Forms.ToolStripMenuItem 'Открыть папку с логами'
 $miProj = New-Object System.Windows.Forms.ToolStripMenuItem 'Открыть папку проекта'
 $miExit = New-Object System.Windows.Forms.ToolStripMenuItem 'Выход'

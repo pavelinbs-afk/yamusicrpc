@@ -1,7 +1,7 @@
-HEAD
 # Logs
 logs
 *.log
+pnpm-debug.log*
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -141,4 +141,6 @@ vite.config.ts.timestamp-*
 
 node_modules/
 .env
-6963f4c (Initial commit)
+
+# Сборки electron-builder (десятки/сотни МБ — не коммитить, GitHub отклоняет >100 МБ)
+release/

@@ -26,6 +26,13 @@ function isRpcAppWindowTitle(t) {
   return /^Yandex\s*Music\s*RPC$/i.test(s) || /^Яндекс\s*Музыка\s*RPC$/i.test(s);
 }
 
+/** Discord ограничивает поля по длине; режем по кодовым точкам, не посередине суррогатной пары. */
+function discordClampText(s, maxChars = 128) {
+  if (s == null || s === '') return '';
+  const chars = Array.from(String(s));
+  return chars.length <= maxChars ? chars.join('') : chars.slice(0, maxChars).join('');
+}
+
 /** Подписи и URL кнопок Rich Presence заданы в приложении, не в настройках. */
 const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Открыть';
 const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Yandex Music Mod';
@@ -359,7 +366,7 @@ function isAllowedCoverUrl(u) {
 function pickLargeImage(track) {
   const cover = track && track.coverUrl;
   if (runtimeConfig.coverArtEnabled && cover && isAllowedCoverUrl(cover)) {
-    const text = (track.album || track.title || 'Яндекс.Музыка').slice(0, 128);
+    const text = discordClampText(track.album || track.title || 'Яндекс.Музыка', 128);
     return { key: cover.slice(0, 512), text };
   }
   return { key: 'yandex_music_icon', text: 'Яндекс.Музыка' };
@@ -398,9 +405,9 @@ async function setActivity(track, timestamps) {
   const posStr = formatTime(elapsedSec);
   const durStr = totalSec > 0 ? formatTime(totalSec) : null;
   const timePart = posStr && durStr ? `${posStr}/${durStr}` : posStr || '';
-  const details = (title || 'Яндекс.Музыка').slice(0, 128);
+  const details = discordClampText(title || 'Яндекс.Музыка', 128);
   const stateBase = [artist || '', album || ''].filter(Boolean).join(' — ');
-  const state = stateBase ? stateBase.slice(0, 128) : undefined;
+  const state = stateBase ? discordClampText(stateBase, 128) : undefined;
   try {
     // Если сервер уже посчитал абсолютные timestamps трека — используем их,
     // чтобы у всех зрителей Discord тайм‑бар был строго привязан к одному старту.
@@ -447,7 +454,7 @@ async function setPausedActivity(track) {
   if (!rpc || !runtimeConfig.rpcEnabled) return;
   const { title = '', artist = '', positionSec, durationSec, url: trackUrl } = track;
   const mainLine = [title || '', artist || ''].filter(Boolean).join(' — ');
-  const stateText = (mainLine || 'Яндекс.Музыка').slice(0, 128);
+  const stateText = discordClampText(mainLine || 'Яндекс.Музыка', 128);
   try {
     const img = pickLargeImage(track);
     const payload = {

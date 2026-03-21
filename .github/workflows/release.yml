@@ -18,8 +18,7 @@ jobs:
 
       - name: pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
+        # Версия берётся из package.json (packageManager), не дублировать — иначе ERR_PNPM_BAD_PM_VERSION
 
       - name: Node.js
         uses: actions/setup-node@v4

@@ -1,6 +1,6 @@
 {
   "name": "yandex-music-discord-rpc",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Официальное приложение RPC для статуса в Discord",
   "author": "Yandex Music RPC",
   "main": "electron/main.js",

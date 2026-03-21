@@ -47,6 +47,14 @@ ipcMain.handle('ym-rpc:quit', () => {
   app.quit();
 });
 
+ipcMain.handle('ym-rpc:app-version', () => {
+  try {
+    return typeof app.getVersion === 'function' ? app.getVersion() : '';
+  } catch (_) {
+    return '';
+  }
+});
+
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();

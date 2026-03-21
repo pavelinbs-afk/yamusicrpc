@@ -2,6 +2,18 @@
 
 Зависимости ставятся через **[pnpm](https://pnpm.io/)**. На машине нужны [Node.js](https://nodejs.org/) и интернет.
 
+## Ошибка Corepack: `Cannot find matching keyid`
+
+Если при вызове `pnpm` падает проверка подписи (несовпадение `keyid` в `corepack.cjs`), это устаревший **Corepack** в составе Node.js относительно текущих ключей реестра менеджеров пакетов. Варианты:
+
+1. **Обновить Node.js** до актуального **LTS** с [nodejs.org](https://nodejs.org/) и снова выполнить `pnpm install` / `pnpm run pack`.
+2. **Поставить pnpm без Corepack:** в PowerShell от администратора  
+   `npm install -g pnpm@9.15.9`  
+   (версия совпадает с полем `packageManager` в `package.json`). После этого `pnpm` из глобальной установки обычно вызывается без ошибки Corepack.
+3. **Официальный установщик pnpm** для Windows: [pnpm.io/installation](https://pnpm.io/installation) (скрипт или `winget` — см. сайт).
+
+Не смешивайте **`npm install`** и уже созданный **`pnpm install`** в одной папке: лучше удалить `node_modules` и переустановить зависимости одним менеджером.
+
 ## Первый раз: pnpm и зависимости
 
 [Установите pnpm](https://pnpm.io/installation), затем в папке проекта:

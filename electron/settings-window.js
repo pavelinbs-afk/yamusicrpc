@@ -1,7 +1,7 @@
 'use strict';
 
 const path = require('path');
-const { BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, shell } = require('electron');
 
 let settingsWindow = null;
 
@@ -13,6 +13,7 @@ function createSettingsWindow() {
     return settingsWindow;
   }
 
+  const ver = typeof app.getVersion === 'function' ? app.getVersion() : '';
   settingsWindow = new BrowserWindow({
     width: 440,
     height: 64,
@@ -21,6 +22,7 @@ function createSettingsWindow() {
     maxHeight: 900,
     show: false,
     frame: false,
+    title: ver ? `Yandex Music RPC v${ver}` : 'Yandex Music RPC',
     titleBarStyle: 'hidden',
     skipTaskbar: false,
     webPreferences: {

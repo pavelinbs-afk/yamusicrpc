@@ -51,6 +51,12 @@
       background: var(--accent);
       color: #fff;
     }
+    .app-version {
+      font-size: 10px;
+      color: var(--muted);
+      flex: 0 0 auto;
+      margin-left: 4px;
+    }
     .bar-track {
       flex: 1;
       min-width: 0;
@@ -220,6 +226,7 @@
 <body>
   <header id="app-bar">
     <span class="rpc-badge">RPC</span>
+    <span class="app-version" id="app-version" title="Версия сборки"></span>
     <div class="bar-track" id="bar-track-line">Нет трека</div>
     <button type="button" class="bar-btn" id="btn-toggle-settings">Настройки</button>
     <button type="button" class="bar-btn bar-close" id="btn-close-app" title="Закрыть">×</button>
@@ -334,6 +341,13 @@
   <script>
     const API = 'http://127.0.0.1:8765';
     const $ = (id) => document.getElementById(id);
+
+    if (window.ymRpc && window.ymRpc.getAppVersion) {
+      window.ymRpc.getAppVersion().then((v) => {
+        const el = $('app-version');
+        if (el && v) el.textContent = 'v' + v;
+      }).catch(() => {});
+    }
 
     let settingsOpen = false;
     function setBarExpanded(open) {

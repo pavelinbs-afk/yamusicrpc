@@ -33,6 +33,19 @@ function discordClampText(s, maxChars = 128) {
   return chars.length <= maxChars ? chars.join('') : chars.slice(0, maxChars).join('');
 }
 
+/** Заголовок окна на экране без трека: слоган, только бренд и т.п. — не Rich Presence. */
+function isYandexAppMarketingTitle(title, artist, album) {
+  const t = (title || '').trim();
+  const a = (artist || '').trim();
+  const al = (album || '').trim();
+  const blob = `${t}\n${a}\n${al}`;
+  if (/собираем\s+музыку|музыку\s+для\s+вас/i.test(blob)) return true;
+  if (/^яндекс[.\u00A0\s]*музыка$/i.test(t) || /^яндекс[.\u00A0\s]*музыка$/i.test(a)) return true;
+  if (/^яндекс\.музыка$/i.test(t) || /^яндекс\.музыка$/i.test(a) || /^яндекс\.музыка$/i.test(al)) return true;
+  if (/^yandex\s*music$/i.test(t) || /^yandex\s*music$/i.test(a)) return true;
+  return false;
+}
+
 /** Подписи и URL кнопок Rich Presence заданы в приложении, не в настройках. */
 const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Открыть';
 const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Yandex Music Mod';
@@ -61,6 +74,10 @@ let discordReconnectInProgress = false;
 let rpcShutdownStarted = false;
 let lastBrowserPostAt = 0;
 let lastDesktopTrackKey = null;
+/** GSMTC часто отдаёт «залипшую» позицию; для сглаживания таймера */
+let lastGsmtcRawPosSec = null;
+let lastGsmtcPollWallMs = null;
+let gsmtcPosStableSinceMs = null;
 /** Для полоски RPC в окне Electron */
 let lastNowPlaying = { title: '', artist: '' };
 
@@ -366,7 +383,11 @@ function isAllowedCoverUrl(u) {
 function pickLargeImage(track) {
   const cover = track && track.coverUrl;
   if (runtimeConfig.coverArtEnabled && cover && isAllowedCoverUrl(cover)) {
-    const text = discordClampText(track.album || track.title || 'Яндекс.Музыка', 128);
+    const junk = isYandexAppMarketingTitle(track.title, track.artist, track.album);
+    const text = discordClampText(
+      junk ? 'Яндекс.Музыка' : (track.album || track.title || 'Яндекс.Музыка'),
+      128,
+    );
     return { key: cover.slice(0, 512), text };
   }
   return { key: 'yandex_music_icon', text: 'Яндекс.Музыка' };
@@ -596,25 +617,31 @@ function mergeConfigPatch(patch) {
   return out;
 }
 
-function getPsScriptPath() {
+function resolveScriptPath(filename) {
   if (process.env.RPC_SCRIPTS_DIR) {
-    const p = path.join(process.env.RPC_SCRIPTS_DIR, 'read-yandex-desktop-title.ps1');
+    const p = path.join(process.env.RPC_SCRIPTS_DIR, filename);
     if (fs.existsSync(p)) return p;
   }
-  const rel = path.join(__dirname, 'scripts', 'read-yandex-desktop-title.ps1');
+  const rel = path.join(__dirname, 'scripts', filename);
   const unpacked = rel.replace(/app\.asar([\\/])/g, 'app.asar.unpacked$1');
   if (fs.existsSync(unpacked)) return unpacked;
   return rel;
 }
 
-function desktopPollOnce() {
+function getPsScriptPath() {
+  return resolveScriptPath('read-yandex-desktop-title.ps1');
+}
+
+function getGsmtcScriptPath() {
+  return resolveScriptPath('read-yandex-gsmtc.ps1');
+}
+
+function runPowerShellFile(scriptPath) {
   return new Promise((resolve) => {
-    if (process.platform !== 'win32') return resolve(null);
-    const scriptPath = getPsScriptPath();
     if (!fs.existsSync(scriptPath)) return resolve(null);
     const ps = spawn(
       'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      ['-NoProfile', '-STA', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
       { windowsHide: true },
     );
     let out = '';
@@ -631,6 +658,40 @@ function desktopPollOnce() {
     });
     ps.on('error', () => resolve(null));
   });
+}
+
+async function desktopPollOnce() {
+  if (process.platform !== 'win32') return null;
+  const gsmtcPath = getGsmtcScriptPath();
+  if (fs.existsSync(gsmtcPath)) {
+    const g = await runPowerShellFile(gsmtcPath);
+    if (g && g.ok && (g.title || g.artist)) {
+      const album = typeof g.album === 'string' ? g.album : '';
+      if (!isYandexAppMarketingTitle(g.title || '', g.artist || '', album)) {
+        const pos = g.positionSec;
+        const dur = g.durationSec;
+        const hasTimeline =
+          typeof pos === 'number' &&
+          Number.isFinite(pos) &&
+          typeof dur === 'number' &&
+          Number.isFinite(dur) &&
+          dur > 0.5 &&
+          pos >= 0 &&
+          pos <= dur + 2;
+        return {
+          ok: true,
+          title: g.title || '',
+          artist: g.artist || '',
+          album,
+          source: 'desktop',
+          positionSec: hasTimeline ? pos : undefined,
+          durationSec: hasTimeline ? dur : undefined,
+          paused: g.paused === true,
+        };
+      }
+    }
+  }
+  return runPowerShellFile(getPsScriptPath());
 }
 
 function postLocalTrackJson(payload) {
@@ -692,18 +753,27 @@ function startDesktopPoller() {
       }
       const key = `${data.title} — ${data.artist || ''}`.trim();
       lastDesktopTrackKey = key;
-      await postLocalTrackJson({
+      const payload = {
         title: data.title,
         artist: data.artist || '',
+        album: typeof data.album === 'string' ? data.album : '',
         source: 'desktop',
-        paused: false,
-      });
+        paused: data.paused === true,
+      };
+      if (typeof data.positionSec === 'number' && Number.isFinite(data.positionSec)) {
+        payload.positionSec = data.positionSec;
+      }
+      if (typeof data.durationSec === 'number' && Number.isFinite(data.durationSec)) {
+        payload.durationSec = data.durationSec;
+      }
+      await postLocalTrackJson(payload);
     } finally {
       busy = false;
     }
   };
-  setInterval(tick, 2000);
-  setTimeout(tick, 1200);
+  const pollMs = Math.max(250, Number(runtimeConfig.desktopPollIntervalMs) || 500);
+  setInterval(tick, pollMs);
+  setTimeout(tick, 400);
 }
 
 function runHttpServer() {
@@ -809,6 +879,9 @@ function runHttpServer() {
           currentTrackKey = null;
           currentTrackStart = null;
           currentTrackDurationSec = null;
+          lastGsmtcRawPosSec = null;
+          lastGsmtcPollWallMs = null;
+          gsmtcPosStableSinceMs = null;
           lastSentTrackKey = null;
           res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
@@ -867,6 +940,24 @@ function runHttpServer() {
           }
           const album = msg.album || '';
           const coverUrl = typeof msg.coverUrl === 'string' ? msg.coverUrl.trim() : '';
+          if (src === 'desktop' && isYandexAppMarketingTitle(title, artist, album)) {
+            lastNowPlaying = { title: '', artist: '' };
+            // Не вызывать clearActivity на каждом тике поллера (2 с), иначе спам «Статус сброшен»
+            // и лишняя нагрузка на Discord IPC. Сбрасываем только если до этого был активный трек.
+            if (currentTrackKey) {
+              await clearActivity();
+              clearIdleTimer();
+              currentTrackKey = null;
+              currentTrackStart = null;
+              currentTrackDurationSec = null;
+              lastGsmtcRawPosSec = null;
+              lastGsmtcPollWallMs = null;
+              gsmtcPosStableSinceMs = null;
+            }
+            res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, ignored: true, reason: 'yandex_idle_ui' }));
+            return;
+          }
           let trackUrl = normalizeTrackUrl(msg.url);
           if (!trackUrl && src === 'desktop') {
             const q = `${title} ${artist}`.trim();
@@ -883,6 +974,9 @@ function runHttpServer() {
             currentTrackKey = null;
             currentTrackStart = null;
             currentTrackDurationSec = null;
+            lastGsmtcRawPosSec = null;
+            lastGsmtcPollWallMs = null;
+            gsmtcPosStableSinceMs = null;
             res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true }));
             return;
@@ -900,6 +994,9 @@ function runHttpServer() {
 
           if (!currentTrackKey || key !== currentTrackKey) {
             currentTrackKey = key;
+            lastGsmtcRawPosSec = null;
+            lastGsmtcPollWallMs = null;
+            gsmtcPosStableSinceMs = null;
             log('Добавлен трек:', title, artist || '(без названия)');
             if (Object.prototype.hasOwnProperty.call(msg, 'url')) {
               log(
@@ -936,8 +1033,18 @@ function runHttpServer() {
             }
           }
 
-          /* Десктоп не отдаёт позицию/длительность: считаем прошедшее время сами; длительность — из конфига (оценка для таймбара). */
-          if (src === 'desktop') {
+          const gsmtcTimeline =
+            src === 'desktop' &&
+            typeof msg.positionSec === 'number' &&
+            Number.isFinite(msg.positionSec) &&
+            typeof msg.durationSec === 'number' &&
+            Number.isFinite(msg.durationSec) &&
+            msg.durationSec > 0.5 &&
+            msg.positionSec >= 0 &&
+            msg.positionSec <= msg.durationSec + 2;
+
+          /* Десктоп без таймлайна GSMTC: время по локальным часам; длительность — оценка из конфига. */
+          if (src === 'desktop' && !gsmtcTimeline) {
             if (currentTrackStart != null) {
               posSec = Math.floor((Date.now() - currentTrackStart) / 1000);
             }
@@ -948,6 +1055,48 @@ function runHttpServer() {
                 currentTrackDurationSec = assume;
               }
             }
+          } else if (src === 'desktop' && gsmtcTimeline) {
+            const raw = Math.max(0, msg.positionSec);
+            const dur = Math.max(0, msg.durationSec);
+            durSec = dur;
+            currentTrackDurationSec = dur;
+
+            const expectedSec =
+              currentTrackStart != null ? (now - currentTrackStart) / 1000 : raw;
+
+            if (lastGsmtcRawPosSec != null && Math.abs(raw - lastGsmtcRawPosSec) < 0.5) {
+              if (gsmtcPosStableSinceMs == null && lastGsmtcPollWallMs != null) {
+                gsmtcPosStableSinceMs = lastGsmtcPollWallMs;
+              }
+            } else {
+              gsmtcPosStableSinceMs = null;
+            }
+
+            const stale =
+              gsmtcPosStableSinceMs != null &&
+              now - gsmtcPosStableSinceMs >= 1200 &&
+              expectedSec > raw + 1.25;
+
+            const seek =
+              !stale &&
+              currentTrackStart != null &&
+              Math.abs(raw - expectedSec) > 3.5;
+
+            if (stale) {
+              posSec = dur > 0
+                ? Math.min(Math.max(0, expectedSec), dur)
+                : Math.max(0, expectedSec);
+            } else if (seek) {
+              currentTrackStart = now - raw * 1000;
+              posSec = dur > 0 ? Math.min(raw, dur) : raw;
+            } else {
+              posSec = dur > 0
+                ? Math.min(Math.max(0, expectedSec), dur)
+                : Math.max(0, expectedSec);
+            }
+
+            lastGsmtcRawPosSec = raw;
+            lastGsmtcPollWallMs = now;
           }
 
           // для таймера Discord и для текста — длительность; не используем durSec если он <= posSec (ошибка)
@@ -1032,7 +1181,7 @@ function runHttpServer() {
   log('Starting HTTP server on port', HTTP_PORT);
   server.listen(HTTP_PORT, '127.0.0.1', () => {
     log(`HTTP сервер: http://127.0.0.1:${HTTP_PORT}/track`);
-    log('Десктопный клиент Яндекс.Музыки (Windows): трек из заголовка окна.');
+    log('Десктопный клиент (Windows): GSMTC (таймлайн) и при необходимости заголовок окна.');
   });
 
   return server;

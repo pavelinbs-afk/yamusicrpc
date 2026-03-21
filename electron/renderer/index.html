@@ -235,11 +235,10 @@
   <div class="layout-inner">
   <aside>
     <h1>Меню</h1>
-    <button type="button" data-section="status" class="active">Статус</button>
     <button type="button" data-section="discord">Discord</button>
-    <button type="button" data-section="source">Источник</button>
     <button type="button" data-section="look">Внешний вид</button>
     <button type="button" data-section="logs">Логи</button>
+    <button type="button" data-section="status" class="active">Статус</button>
   </aside>
   <main>
     <section id="sec-status" class="panel">
@@ -271,26 +270,6 @@
       <p class="hint">
         Вторая кнопка в Discord ведёт на фиксированный адрес из приложения. Если выключить, остаётся только кнопка открытия трека.
       </p>
-    </section>
-
-    <section id="sec-source" class="panel hidden">
-      <h2>Источник трека</h2>
-      <p class="hint" style="margin-top:0">
-        Трек и исполнитель берутся из <strong>заголовка окна</strong> официального приложения Яндекс.Музыки (Windows). Веб-версия и встроенный браузер не используются.
-      </p>
-      <label class="row" style="margin-top:12px">
-        <span>Опрос окна десктопа (Windows)</span>
-        <input type="checkbox" id="desktop-poll" />
-      </label>
-      <p class="hint">
-        Если опрос выключен, статус из клиента не подхватится. Для обложек в Discord по-прежнему нужен трек из клиента; отдельной обложки из заголовка окна нет — используется иконка приложения в Discord.
-      </p>
-      <label class="row" style="margin-top:12px"><span>Оценка длительности трека для таймбара (сек)</span></label>
-      <input type="number" id="desktop-assume-sec" min="0" max="3600" placeholder="210" />
-      <p class="hint">Клиент Windows не сообщает длину трека — для зелёной полосы в Discord берётся это число (по умолчанию ~3,5 мин). Поставьте 0, если полоса не нужна.</p>
-      <div class="actions">
-        <button type="button" class="primary" id="btn-save-source">Сохранить</button>
-      </div>
     </section>
 
     <section id="sec-look" class="panel hidden">
@@ -436,9 +415,6 @@
     function fillForm(cfg) {
       $('rpc-enabled').checked = cfg.rpcEnabled !== false;
       $('discord-show-mod-btn').checked = cfg.discordShowModButton !== false;
-      $('desktop-poll').checked = cfg.desktopPollingEnabled !== false;
-      const das = $('desktop-assume-sec');
-      if (das) das.value = cfg.desktopAssumedDurationSec != null ? cfg.desktopAssumedDurationSec : 210;
       $('theme').value = cfg.theme || 'dark';
       $('font-family').value = cfg.fontFamily || '';
       $('font-size').value = cfg.fontSizePx || 14;
@@ -498,13 +474,6 @@
     }
     $('rpc-enabled').addEventListener('change', saveDiscordToggles);
     $('discord-show-mod-btn').addEventListener('change', saveDiscordToggles);
-    $('btn-save-source').addEventListener('click', () => {
-      savePartial({
-        preferredSource: 'desktop',
-        desktopPollingEnabled: $('desktop-poll').checked,
-        desktopAssumedDurationSec: Number($('desktop-assume-sec').value) || 0,
-      });
-    });
     $('btn-save-look').addEventListener('click', () => {
       savePartial({
         theme: $('theme').value,

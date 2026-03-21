@@ -7,12 +7,16 @@
 Если при вызове `pnpm` падает проверка подписи (несовпадение `keyid` в `corepack.cjs`), это устаревший **Corepack** в составе Node.js относительно текущих ключей реестра менеджеров пакетов. Варианты:
 
 1. **Обновить Node.js** до актуального **LTS** с [nodejs.org](https://nodejs.org/) и снова выполнить `pnpm install` / `pnpm run pack`.
-2. **Поставить pnpm без Corepack:** в PowerShell от администратора  
+2. **Поставить pnpm без Corepack:**  
    `npm install -g pnpm@9.15.9`  
-   (версия совпадает с полем `packageManager` в `package.json`). После этого `pnpm` из глобальной установки обычно вызывается без ошибки Corepack.
+   (версия совпадает с полем `packageManager` в `package.json`). При необходимости отключите шим Corepack: `corepack disable`, чтобы в PATH использовался глобальный `pnpm`.
 3. **Официальный установщик pnpm** для Windows: [pnpm.io/installation](https://pnpm.io/installation) (скрипт или `winget` — см. сайт).
 
 Не смешивайте **`npm install`** и уже созданный **`pnpm install`** в одной папке: лучше удалить `node_modules` и переустановить зависимости одним менеджером.
+
+## Windows: NSIS и длинные пути
+
+Если **`makensis`** падает с `!include: could not open file: ...\node_modules\.pnpm\...\app-builder-lib\...\allowOnlyOneInstallerInstance.nsh`, это лимит длины пути у NSIS при глубокой вложенности **pnpm**. В корне репозитория в **`.npmrc`** задано **`node-linker=hoisted`** (более плоский `node_modules`). После смены режима выполните **`pnpm install`** заново (при сомнениях удалите папку **`node_modules`** и снова установите зависимости). Альтернатива — перенести проект в короткий путь, например `C:\dev\yandex-music-rpc`, или включить поддержку длинных путей в Windows.
 
 ## Первый раз: pnpm и зависимости
 

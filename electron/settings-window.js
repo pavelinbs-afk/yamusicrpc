@@ -15,11 +15,11 @@ function createSettingsWindow() {
 
   const ver = typeof app.getVersion === 'function' ? app.getVersion() : '';
   settingsWindow = new BrowserWindow({
-    width: 440,
+    width: 560,
     height: 64,
-    minWidth: 360,
+    minWidth: 480,
     minHeight: 56,
-    maxHeight: 900,
+    maxHeight: 820,
     show: false,
     frame: false,
     title: ver ? `Yandex Music RPC v${ver}` : 'Yandex Music RPC',
@@ -40,7 +40,12 @@ function createSettingsWindow() {
     settingsWindow = null;
   });
   settingsWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'http:' || u.protocol === 'https:') {
+        shell.openExternal(url);
+      }
+    } catch (_) {}
     return { action: 'deny' };
   });
 

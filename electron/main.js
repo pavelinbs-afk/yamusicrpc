@@ -38,8 +38,8 @@ ipcMain.handle('ym-rpc:set-expanded', (_e, expanded) => {
   const win = getSettingsWindow();
   if (!win || win.isDestroyed()) return;
   const b = win.getBounds();
-  const w = Math.max(b.width, 400);
-  const h = expanded ? 720 : 64;
+  const w = Math.max(b.width, 520);
+  const h = expanded ? 640 : 64;
   win.setBounds({ x: b.x, y: b.y, width: w, height: h }, true);
 });
 

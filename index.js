@@ -33,6 +33,17 @@ function discordClampText(s, maxChars = 128) {
   return chars.length <= maxChars ? chars.join('') : chars.slice(0, maxChars).join('');
 }
 
+/** Число из JSON (PowerShell ConvertTo-Json иногда отдаёт строку). */
+function parseFiniteNumber(v) {
+  if (v == null) return null;
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
 /** Заголовок окна на экране без трека: слоган, только бренд и т.п. — не Rich Presence. */
 function isYandexAppMarketingTitle(title, artist, album) {
   const t = (title || '').trim();
@@ -47,7 +58,7 @@ function isYandexAppMarketingTitle(title, artist, album) {
 }
 
 /** Подписи и URL кнопок Rich Presence заданы в приложении, не в настройках. */
-const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Открыть';
+const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Открыть трек';
 const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Yandex Music Mod';
 const DISCORD_FIXED_MOD_BTN_URL = 'https://github.com/Stephanzion/YandexMusicBetaMod';
 
@@ -668,13 +679,11 @@ async function desktopPollOnce() {
     if (g && g.ok && (g.title || g.artist)) {
       const album = typeof g.album === 'string' ? g.album : '';
       if (!isYandexAppMarketingTitle(g.title || '', g.artist || '', album)) {
-        const pos = g.positionSec;
-        const dur = g.durationSec;
+        const pos = parseFiniteNumber(g.positionSec);
+        const dur = parseFiniteNumber(g.durationSec);
         const hasTimeline =
-          typeof pos === 'number' &&
-          Number.isFinite(pos) &&
-          typeof dur === 'number' &&
-          Number.isFinite(dur) &&
+          pos != null &&
+          dur != null &&
           dur > 0.5 &&
           pos >= 0 &&
           pos <= dur + 2;
@@ -985,12 +994,18 @@ function runHttpServer() {
           lastNowPlaying = { title: title || '', artist: artist || '' };
 
           const now = Date.now();
-          let posSec = typeof msg.positionSec === 'number' && Number.isFinite(msg.positionSec)
-            ? Math.max(0, msg.positionSec)
-            : null;
-          let durSec = typeof msg.durationSec === 'number' && Number.isFinite(msg.durationSec)
-            ? Math.max(0, msg.durationSec)
-            : null;
+          const posParsed = parseFiniteNumber(msg.positionSec);
+          const durParsed = parseFiniteNumber(msg.durationSec);
+          let posSec = posParsed != null ? Math.max(0, posParsed) : null;
+          let durSec = durParsed != null ? Math.max(0, durParsed) : null;
+
+          const gsmtcTimeline =
+            src === 'desktop' &&
+            posSec != null &&
+            durSec != null &&
+            durSec > 0.5 &&
+            posSec >= 0 &&
+            posSec <= durSec + 2;
 
           if (!currentTrackKey || key !== currentTrackKey) {
             currentTrackKey = key;
@@ -1016,8 +1031,8 @@ function runHttpServer() {
             // новая песня — берём durationSec только если он > posSec (иначе это ошибка: duration = elapsed)
             currentTrackDurationSec = (durSec != null && (posSec == null || durSec > posSec)) ? durSec : null;
           } else {
-            // тот же трек: при перемотке подстраиваем currentTrackStart, чтобы тайм-бар сдвинулся
-            if (posSec != null && currentTrackStart != null) {
+            // тот же трек: при перемотке подстраиваем currentTrackStart (не для GSMTC — там «сырая» позиция часто врёт)
+            if (!gsmtcTimeline && posSec != null && currentTrackStart != null) {
               const expectedPosSec = (now - currentTrackStart) / 1000;
               if (Math.abs(expectedPosSec - posSec) > 4) {
                 currentTrackStart = now - posSec * 1000;
@@ -1033,16 +1048,6 @@ function runHttpServer() {
             }
           }
 
-          const gsmtcTimeline =
-            src === 'desktop' &&
-            typeof msg.positionSec === 'number' &&
-            Number.isFinite(msg.positionSec) &&
-            typeof msg.durationSec === 'number' &&
-            Number.isFinite(msg.durationSec) &&
-            msg.durationSec > 0.5 &&
-            msg.positionSec >= 0 &&
-            msg.positionSec <= msg.durationSec + 2;
-
           /* Десктоп без таймлайна GSMTC: время по локальным часам; длительность — оценка из конфига. */
           if (src === 'desktop' && !gsmtcTimeline) {
             if (currentTrackStart != null) {
@@ -1056,8 +1061,8 @@ function runHttpServer() {
               }
             }
           } else if (src === 'desktop' && gsmtcTimeline) {
-            const raw = Math.max(0, msg.positionSec);
-            const dur = Math.max(0, msg.durationSec);
+            const raw = posSec;
+            const dur = durSec;
             durSec = dur;
             currentTrackDurationSec = dur;
 
@@ -1077,10 +1082,11 @@ function runHttpServer() {
               now - gsmtcPosStableSinceMs >= 1200 &&
               expectedSec > raw + 1.25;
 
+            /* Перемотка только по скачку сырой позиции между опросами; не сравнивать с expected — иначе цикл 0→4→сброс */
             const seek =
               !stale &&
-              currentTrackStart != null &&
-              Math.abs(raw - expectedSec) > 3.5;
+              lastGsmtcRawPosSec != null &&
+              Math.abs(raw - lastGsmtcRawPosSec) > 3.5;
 
             if (stale) {
               posSec = dur > 0
@@ -1106,9 +1112,8 @@ function runHttpServer() {
             : (durSecValid ? durSec : null);
 
           let endsAtMs = null;
-          if (effectiveDurSec != null) {
-            const durMs = effectiveDurSec * 1000;
-            endsAtMs = currentTrackStart + durMs;
+          if (effectiveDurSec != null && currentTrackStart != null && Number.isFinite(currentTrackStart)) {
+            endsAtMs = currentTrackStart + effectiveDurSec * 1000;
           }
 
           // время для логов и для текстового отображения в Discord:

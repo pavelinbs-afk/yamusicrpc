@@ -1,8 +1,10 @@
 # Яндекс.Музыка → Discord
 
-Обычное приложение для Windows: **установил — запустил**, без командной строки и без лишних окон.
+Обычное приложение для Windows: Без командной строки и без лишних окон.
 
-Типы установщиков после **локальной сборки** (`pnpm run dist`, см. [RELEASE.md](RELEASE.md)):
+[Скачать](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v1.5.1)
+
+Типы установщиков после **[локальной сборки](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v1.5.1)**:
 
 - **`.exe`** (NSIS) — обычный мастер установки, ярлык в меню «Пуск».
 - **`.msi`** — по желанию, тот же продукт в формате Windows Installer (удобно для корпоративных сценариев).
@@ -47,3 +49,5 @@
 ## Сборка установщиков
 
 Для разработчиков: **[RELEASE.md](RELEASE.md)** и **[BUILD.md](BUILD.md)**.
+
+ (`pnpm run dist`, см. [RELEASE.md](RELEASE.md))

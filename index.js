@@ -60,7 +60,7 @@ function isYandexAppMarketingTitle(title, artist, album) {
 /** Подписи и URL кнопок Rich Presence заданы в приложении, не в настройках. */
 const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Открыть трек';
 const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Yandex Music Mod';
-const DISCORD_FIXED_MOD_BTN_URL = 'https://github.com/Stephanzion/YandexMusicBetaMod';
+const DISCORD_FIXED_MOD_BTN_URL = 'https://github.com/pavelinbs-afk/yamusicrpc';
 
 const HTTP_PORT = 8765;
 const CLOCK_SYNC_URL = 'https://worldtimeapi.org/api/timezone/Etc/UTC';

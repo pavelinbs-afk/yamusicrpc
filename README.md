@@ -1,6 +1,8 @@
 # Яндекс.Музыка → Discord
 
-Обычное приложение для Windows: **установил — запустил**, без командной строки и без лишних окон.
+Обычное приложение для Windows: Без командной строки и без лишних окон.
+
+[Скачать](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v1.5.1)
 
 Типы установщиков после **[локальной сборки](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v1.5.1)**:
 
@@ -47,3 +49,5 @@
 ## Сборка установщиков
 
 Для разработчиков: **[RELEASE.md](RELEASE.md)** и **[BUILD.md](BUILD.md)**.
+
+ (`pnpm run dist`, см. [RELEASE.md](RELEASE.md))

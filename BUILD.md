@@ -26,13 +26,9 @@
 pnpm install --frozen-lockfile
 ```
 
-## Автоматически (рекомендуется)
+## Сборка на своём ПК
 
-При пуше **тега** вида `v1.0.0` GitHub Actions сам поставит pnpm, выполнит `pnpm install --frozen-lockfile`, соберёт установщики и прикрепит файлы к релизу.
-
-## Вручную на своём ПК
-
-Полная команда **`pnpm run dist`** собирает NSIS, portable и **MSI**. Для MSI на сборочной машине нужен [WiX Toolset](https://wixtoolset.org/) 3.11+ (например `choco install wixtoolset` или установщик с сайта). В GitHub Actions WiX ставится автоматически.
+Полная команда **`pnpm run dist`** собирает NSIS, portable и **MSI**. Для MSI на сборочной машине нужен [WiX Toolset](https://wixtoolset.org/) **v3** (см. [RELEASE.md](RELEASE.md); **не** WiX v4).
 
 Если WiX не установлен, соберите только `.exe` (без MSI):
 

@@ -8,9 +8,10 @@
   "scripts": {
     "app": "electron .",
     "postinstall": "node scripts/patch-discord-rpc.js",
-    "dist": "electron-builder --win --x64",
-    "dist:nomsi": "electron-builder --win nsis portable --x64",
-    "pack": "electron-builder --win --x64 --dir",
+    "icon": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-build-icon.ps1",
+    "dist": "pnpm run icon && electron-builder --win --x64",
+    "dist:nomsi": "pnpm run icon && electron-builder --win nsis portable --x64",
+    "pack": "pnpm run icon && electron-builder --win --x64 --dir",
     "dev:rpc": "node index.js"
   },
   "dependencies": {
@@ -32,6 +33,7 @@
       "scripts/**/*.ps1"
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         {
           "target": "nsis",

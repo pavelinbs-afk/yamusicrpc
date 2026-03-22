@@ -1,51 +1,36 @@
-# Релизы (сборка и GitHub)
+# Сборка установщиков (Windows)
 
-Кратко для тех, кто публикует установщики.
+Кратко для тех, кто собирает `.exe` / `.msi` из исходников.
 
-## Локальная сборка (Windows)
+## Где MSI?
 
-1. Установите [Node.js](https://nodejs.org/) LTS и [pnpm](https://pnpm.io/) (или используйте `corepack enable`).
+Имя файла: **`Yandex Music RPC-<версия>-x64.msi`** (рядом с `.exe` в папке **`release/`**).
+
+Для MSI нужен **WiX Toolset v3** (например 3.14.x). Без него `electron-builder` собирает только **NSIS `.exe`** и **portable `.exe`**, MSI **не создаётся** — это нормально.
+
+**WiX v4** с `electron-builder` даёт ошибку линковщика **`LGHT0094`** / `Icon:…exe could not be found` — ставьте **v3**, не v4.
+
+```powershell
+choco install wixtoolset --version=3.14.1.20250415 -y
+```
+
+Если уже стоит **WiX 4**, удалите его, затем поставьте пакет выше. Перезапустите терминал, затем `pnpm run dist`.
+
+Перед каждой сборкой **`pnpm run icon`** создаёт `build/icon.ico` (вызывается из `dist` / `pack`, см. `package.json`).
+
+## Команды
+
+1. Установите [Node.js](https://nodejs.org/) LTS и [pnpm](https://pnpm.io/).
 2. В корне репозитория:
    ```bash
    pnpm install
    pnpm run dist
    ```
-3. Готовые файлы появятся в папке **`release/`**:
-   - **`Yandex Music RPC-<версия>-x64.exe`** — установщик NSIS;
-   - **`Yandex Music RPC-<версия>-portable.exe`** — portable без установки;
-   - **`Yandex Music RPC-<версия>-x64.msi`** — MSI (для MSI на машине сборки нужен WiX; в CI он ставится автоматически).
+3. Артефакты в **`release/`**:
+   - **`Yandex Music RPC-<версия>-x64.exe`** — NSIS;
+   - **`Yandex Music RPC-<версия>-portable.exe`** — portable;
+   - **`Yandex Music RPC-<версия>-x64.msi`** — MSI (только при установленном WiX v3).
 
-Без MSI: `pnpm run dist:nomsi` (только NSIS + portable, см. `package.json`).
+Без MSI: **`pnpm run dist:nomsi`** (только NSIS + portable).
 
-## Публикация на GitHub Releases
-
-### Автоматически (рекомендуется)
-
-1. Обновите версию в **`package.json`** (поле `version`), закоммитьте.
-2. Создайте и отправьте **git-тег** в формате `v*`, например:
-   ```bash
-   git tag v1.5.1
-   git push origin v1.5.1
-   ```
-3. Сработает workflow **`.github/workflows/release.yml`**: на `windows-latest` выполнится `pnpm install` и `pnpm run dist`, затем **`softprops/action-gh-release`** прикрепит к релизу все **`release/*.exe`** и **`release/*.msi`**.
-
-Убедитесь, что в репозитории включены **Actions** и у них есть право **создавать релизы** (для `GITHUB_TOKEN` в форках/организациях иногда нужны настройки).
-
-### Ручная загрузка
-
-1. Соберите локально (`pnpm run dist`).
-2. На GitHub: **Releases → Draft a new release** (или отредактируйте существующий релиз).
-3. Укажите тег и название, в блок **Assets** перетащите файлы из **`release/`** (`.exe` и при необходимости `.msi`).
-4. Опубликуйте релиз.
-
-### Что скачивают пользователи
-
-- Обычный установщик: **`Yandex Music RPC-*-x64.exe`**.
-- Без установки в систему: **`*-portable.exe`**.
-- MSI — по желанию (корпоративные сценарии).
-
-Файл **`latest.yml`** в `release/` нужен только приложениям с автообновлением (electron-updater); в текущем `package.json` он не подключён — для ручной раздачи достаточно прикрепить `.exe` / `.msi` к релизу.
-
-## Запуск workflow без тега
-
-При **workflow_dispatch** (кнопка *Run workflow* в GitHub Actions) сборка выполнится, артефакты попадут в **Actions → конкретный run → Artifacts** (`windows-installers`), но к **Release** на GitHub они **не прикрепятся** (в YAML это сделано только для `push` тегов `v*`).
+Подробности по окружению и типичным ошибкам сборки — в **[BUILD.md](BUILD.md)**.

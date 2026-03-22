@@ -145,5 +145,6 @@ node_modules/
 # Сборки electron-builder (десятки/сотни МБ — не коммитить, GitHub отклоняет >100 МБ)
 release/
 
-# Генерируется scripts/generate-build-icon.ps1 перед dist
+# Генерируется scripts/generate-build-icon.ps1 перед dist / postinstall
 build/icon.ico
+electron/icon.ico

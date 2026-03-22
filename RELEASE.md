@@ -16,7 +16,7 @@ choco install wixtoolset --version=3.14.1.20250415 -y
 
 Если уже стоит **WiX 4**, удалите его, затем поставьте пакет выше. Перезапустите терминал, затем `pnpm run dist`.
 
-Перед каждой сборкой **`pnpm run icon`** создаёт `build/icon.ico` (вызывается из `dist` / `pack`, см. `package.json`).
+Перед каждой сборкой **`pnpm run icon`** создаёт **`build/icon.ico`** и **`electron/icon.ico`** (окно приложения и установщик). После `pnpm install` при отсутствии файлов срабатывает **`scripts/ensure-icon.js`**.
 
 ## Команды
 

@@ -2,11 +2,22 @@
 
 const net = require('net');
 const path = require('path');
-const { app, ipcMain, dialog } = require('electron');
+const { app, ipcMain, dialog, Tray, Menu, nativeImage } = require('electron');
 const { projectRoot, getScriptsDir } = require('./paths');
-const { createSettingsWindow, showSettingsWindow, getSettingsWindow } = require('./settings-window');
+const { getAppIconPath } = require('./icon-path');
+const lifecycle = require('./app-lifecycle');
+const {
+  createSettingsWindow,
+  showSettingsWindow,
+  getSettingsWindow,
+  showWindowFromTray,
+  hideWindowToTray,
+} = require('./settings-window');
 
 const indexEntryPath = path.join(projectRoot(), 'index.js');
+
+/** @type {Electron.Tray | null} */
+let tray = null;
 
 function waitForLocalPort(port, opts = {}) {
   const host = opts.host || '127.0.0.1';
@@ -34,6 +45,46 @@ function waitForLocalPort(port, opts = {}) {
   });
 }
 
+function destroyTray() {
+  if (!tray) return;
+  try {
+    tray.destroy();
+  } catch (_) {}
+  tray = null;
+}
+
+function createTray() {
+  destroyTray();
+  const iconPath = getAppIconPath();
+  if (!iconPath) return;
+  let img;
+  try {
+    img = nativeImage.createFromPath(iconPath);
+    if (img.isEmpty()) return;
+  } catch (_) {
+    return;
+  }
+  tray = new Tray(img);
+  tray.setToolTip('Yandex Music RPC');
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      {
+        label: 'Показать окно',
+        click: () => showWindowFromTray(),
+      },
+      { type: 'separator' },
+      {
+        label: 'Выход',
+        click: () => {
+          lifecycle.setQuitting(true);
+          app.quit();
+        },
+      },
+    ]),
+  );
+  tray.on('double-click', () => showWindowFromTray());
+}
+
 ipcMain.handle('ym-rpc:set-expanded', (_e, expanded) => {
   const win = getSettingsWindow();
   if (!win || win.isDestroyed()) return;
@@ -43,7 +94,12 @@ ipcMain.handle('ym-rpc:set-expanded', (_e, expanded) => {
   win.setBounds({ x: b.x, y: b.y, width: w, height: h }, true);
 });
 
+ipcMain.handle('ym-rpc:hide-to-tray', () => {
+  hideWindowToTray();
+});
+
 ipcMain.handle('ym-rpc:quit', () => {
+  lifecycle.setQuitting(true);
   app.quit();
 });
 
@@ -59,6 +115,10 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.yandexmusic.discordrpc');
+  }
+
   app.on('second-instance', () => {
     showSettingsWindow();
   });
@@ -67,6 +127,7 @@ if (!gotLock) {
   app.on('before-quit', (e) => {
     if (beforeQuitDone) return;
     beforeQuitDone = true;
+    destroyTray();
     e.preventDefault();
     try {
       const rpcMod = require(indexEntryPath);
@@ -119,9 +180,6 @@ if (!gotLock) {
 
     const win = createSettingsWindow();
     win.center();
+    createTray();
   });
 }
-
-app.on('window-all-closed', () => {
-  app.quit();
-});

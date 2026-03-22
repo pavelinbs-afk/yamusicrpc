@@ -2,19 +2,39 @@
 
 const path = require('path');
 const { app, BrowserWindow, shell } = require('electron');
+const { getAppIconPath } = require('./icon-path');
+const lifecycle = require('./app-lifecycle');
 
 let settingsWindow = null;
 
+function windowIconPath() {
+  return getAppIconPath();
+}
+
+function showWindowFromTray() {
+  const w = settingsWindow && !settingsWindow.isDestroyed() ? settingsWindow : null;
+  if (!w) return;
+  w.show();
+  w.setSkipTaskbar(false);
+  if (w.isMinimized()) w.restore();
+  w.focus();
+}
+
+function hideWindowToTray() {
+  const w = getSettingsWindow();
+  if (!w || w.isDestroyed()) return;
+  w.hide();
+  w.setSkipTaskbar(true);
+}
+
 function createSettingsWindow() {
   if (settingsWindow && !settingsWindow.isDestroyed()) {
-    settingsWindow.show();
-    if (settingsWindow.isMinimized()) settingsWindow.restore();
-    settingsWindow.focus();
+    showWindowFromTray();
     return settingsWindow;
   }
 
   const ver = typeof app.getVersion === 'function' ? app.getVersion() : '';
-  settingsWindow = new BrowserWindow({
+  const winOpts = {
     width: 560,
     height: 64,
     minWidth: 480,
@@ -30,6 +50,16 @@ function createSettingsWindow() {
       nodeIntegration: false,
       preload: path.join(__dirname, 'preload.js'),
     },
+  };
+  const icon = windowIconPath();
+  if (icon) winOpts.icon = icon;
+  settingsWindow = new BrowserWindow(winOpts);
+
+  settingsWindow.on('close', (e) => {
+    if (!lifecycle.isQuitting()) {
+      e.preventDefault();
+      hideWindowToTray();
+    }
   });
 
   settingsWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
@@ -54,6 +84,7 @@ function createSettingsWindow() {
 
 function showSettingsWindow() {
   createSettingsWindow();
+  showWindowFromTray();
 }
 
 function getSettingsWindow() {
@@ -64,4 +95,6 @@ module.exports = {
   createSettingsWindow,
   showSettingsWindow,
   getSettingsWindow,
+  showWindowFromTray,
+  hideWindowToTray,
 };

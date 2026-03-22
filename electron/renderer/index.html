@@ -75,6 +75,12 @@
       font: inherit;
       font-size: 13px;
     }
+    .bar-min {
+      padding: 2px 12px;
+      font-size: 16px;
+      line-height: 1;
+      font-weight: 600;
+    }
     .bar-close {
       padding: 2px 10px;
       font-size: 20px;
@@ -229,7 +235,8 @@
     <span class="app-version" id="app-version" title="Версия сборки"></span>
     <div class="bar-track" id="bar-track-line">Нет трека</div>
     <button type="button" class="bar-btn" id="btn-toggle-settings">Настройки</button>
-    <button type="button" class="bar-btn bar-close" id="btn-close-app" title="Закрыть">×</button>
+    <button type="button" class="bar-btn bar-min" id="btn-min-to-tray" title="Свернуть в трей">_</button>
+    <button type="button" class="bar-btn bar-close" id="btn-close-app" title="Свернуть в трей">×</button>
   </header>
   <div id="settings-shell" class="settings-hidden">
   <div class="layout-inner">
@@ -244,7 +251,7 @@
     <section id="sec-status" class="panel">
       <h2>Статус</h2>
       <p class="hint" style="margin:0 0 10px">
-        Верхняя полоска: <strong>RPC</strong> и текущий трек. Кнопка <strong>«Настройки»</strong> открывает эту панель в том же окне. Трек берётся из <strong>десктопного клиента</strong> Яндекс.Музыки (Windows). Запустите клиент и включите воспроизведение.
+        Верхняя полоска: <strong>RPC</strong> и текущий трек. Кнопка <strong>«Настройки»</strong> открывает эту панель в том же окне. <strong>_</strong> и <strong>×</strong> сворачивают окно в <strong>трей</strong> (иконка у часов) — открыть снова: «Показать окно» в меню по правому клику по иконке или двойной щелчок по ней. Трек берётся из <strong>десктопного клиента</strong> Яндекс.Музыки (Windows). Запустите клиент и включите воспроизведение.
       </p>
       <div class="status" id="status-text">Загрузка…</div>
       <div class="actions">
@@ -463,9 +470,11 @@
     $('btn-toggle-settings').addEventListener('click', () => {
       setBarExpanded(!settingsOpen);
     });
-    $('btn-close-app').addEventListener('click', () => {
-      if (window.ymRpc && window.ymRpc.quitApp) window.ymRpc.quitApp();
-    });
+    function sendToTray() {
+      if (window.ymRpc && window.ymRpc.hideToTray) window.ymRpc.hideToTray();
+    }
+    $('btn-min-to-tray').addEventListener('click', sendToTray);
+    $('btn-close-app').addEventListener('click', sendToTray);
     function saveDiscordToggles() {
       savePartial({
         rpcEnabled: $('rpc-enabled').checked,

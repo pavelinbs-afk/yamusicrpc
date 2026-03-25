@@ -57,7 +57,7 @@ function isYandexAppMarketingTitle(title, artist, album) {
   return false;
 }
 
-/** Подписи и URL кнопок Rich Presence заданы в приложении, не в настройках. */
+
 const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Открыть трек';
 const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Yandex Music Mod';
 const DISCORD_FIXED_MOD_BTN_URL = 'https://github.com/pavelinbs-afk/yamusicrpc';

@@ -65,11 +65,15 @@ const DISCORD_FIXED_MOD_BTN_URL = 'https://github.com/pavelinbs-afk/yamusicrpc';
 const HTTP_PORT = 8765;
 const CLOCK_SYNC_URL = 'https://worldtimeapi.org/api/timezone/Etc/UTC';
 const CLOCK_SYNC_INTERVAL_MS = 5 * 60 * 1000; // сверка часов раз в 5 минут
-const IDLE_CLEAR_MS = 60 * 1000; // через минуту без обновлений — сбрасываем статус
+/** Нет входящих обновлений трека (приложение закрыто и т.п.) — сброс статуса */
+const IDLE_CLEAR_MS = 5 * 60 * 1000;
+/** Пауза: один раз при входе в паузу; не сбрасывать при каждом тике поллера */
+const PAUSED_CLEAR_MS = 5 * 60 * 1000;
 const DISCORD_UPDATE_INTERVAL_MS = 500; // обновление раз в 0.5 сек; зелёный таймер = время трека
 
 let rpc = null;
 let idleTimer = null;
+let pausedClearTimer = null;
 let currentTrackKey = null;
 let currentTrackStart = null;
 let currentTrackDurationSec = null; // фиксируем длительность трека один раз при старте
@@ -316,6 +320,32 @@ function clearIdleTimer() {
     clearTimeout(idleTimer);
     idleTimer = null;
   }
+  if (pausedClearTimer) {
+    clearTimeout(pausedClearTimer);
+    pausedClearTimer = null;
+  }
+}
+
+function schedulePausedClear() {
+  clearIdleTimer();
+  pausedClearTimer = setTimeout(() => {
+    pausedClearTimer = null;
+    (async () => {
+      try {
+        await clearActivity();
+        currentTrackKey = null;
+        currentTrackStart = null;
+        currentTrackDurationSec = null;
+        lastGsmtcRawPosSec = null;
+        lastGsmtcPollWallMs = null;
+        gsmtcPosStableSinceMs = null;
+        lastSentTrackKey = null;
+        lastSentButtonUrl = null;
+        lastNowPlaying = { title: '', artist: '' };
+        log('Статус сброшен: пауза без возобновления дольше', Math.round(PAUSED_CLEAR_MS / 60000), 'мин.');
+      } catch (_) {}
+    })();
+  }, PAUSED_CLEAR_MS);
 }
 
 function setIdleTimer() {
@@ -508,7 +538,7 @@ async function setPausedActivity(track) {
   } catch (e) {
     log('Ошибка setActivity (пауза):', e.message);
   }
-  setIdleTimer();
+  // Не вызывать setIdleTimer здесь: поллер шлёт паузу каждые ~2 с — таймер бы сбрасывался бесконечно.
 }
 
 async function clearActivity() {
@@ -1128,6 +1158,9 @@ function runHttpServer() {
           log('Статус обновлён на сервере', `(${timePartLog})`, '(скорость обновления раз в 0.3 сек)');
 
           if (msg.paused) {
+            if (lastSentTrackKey !== '__paused__') {
+              schedulePausedClear();
+            }
             const durationForPauseSec = effectiveDurSec != null ? effectiveDurSec : durSec;
             setPausedActivity({
               title,
@@ -1141,6 +1174,9 @@ function runHttpServer() {
             lastSentTrackKey = '__paused__';
             lastDiscordActivityAt = now;
           } else {
+            if (lastSentTrackKey === '__paused__') {
+              clearIdleTimer();
+            }
             // Резум с паузы — пересчитываем currentTrackStart, чтобы таймер шёл с правильной позиции
             if (lastSentTrackKey === '__paused__' && posSec != null) {
               currentTrackStart = now - posSec * 1000;

@@ -4,7 +4,7 @@
 
 [Скачать](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v1.5.1)
 
-Типы установщиков после **[локальной сборки](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v1.5.1)**:
+Типы установщиков после **[локальной сборки:](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v1.5.1)**
 
 - **`.exe`** (NSIS) — обычный мастер установки, ярлык в меню «Пуск».
 - **`.msi`** — по желанию, тот же продукт в формате Windows Installer (удобно для корпоративных сценариев).

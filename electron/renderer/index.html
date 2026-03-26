@@ -251,7 +251,7 @@
     <section id="sec-status" class="panel">
       <h2>Статус</h2>
       <p class="hint" style="margin:0 0 10px">
-        Верхняя полоска: <strong>RPC</strong> и текущий трек. Кнопка <strong>«Настройки»</strong> открывает эту панель в том же окне. <strong>_</strong> и <strong>×</strong> сворачивают окно в <strong>трей</strong> (иконка у часов) — открыть снова: «Показать окно» в меню по правому клику по иконке или двойной щелчок по ней. Трек берётся из <strong>десктопного клиента</strong> Яндекс.Музыки (Windows). Запустите клиент и включите воспроизведение.
+        Верхняя полоска: <strong>RPC</strong> и текущий трек. Кнопка <strong>«Настройки»</strong> открывает эту панель в том же окне. <strong>—</strong> и <strong>×</strong> сворачивают окно в <strong>трей</strong> — открыть снова: «Показать окно» в меню по правому клику по иконке или двойной щелчок по ней. Трек берётся из <strong>десктопного клиента</strong> Яндекс.Музыки (Windows). Запустите клиент и включите воспроизведение.
       </p>
       <div class="status" id="status-text">Загрузка…</div>
       <div class="actions">
@@ -267,7 +267,7 @@
         <input type="checkbox" class="checkbox-lg" id="rpc-enabled" />
       </label>
       <p class="hint">
-        Статус «Слушает…», обложка и таймер. При отключении активность в Discord сбрасывается.
+        Статус «Слушает…». При отключении активность в Discord сбрасывается.
       </p>
 
       <label class="row row-toggle" style="margin-top:16px">
@@ -275,7 +275,7 @@
         <input type="checkbox" class="checkbox-lg" id="discord-show-mod-btn" />
       </label>
       <p class="hint">
-        Вторая кнопка в Discord ведёт на фиксированный адрес из приложения. Если выключить, остаётся только кнопка открытия трека.
+      Убирает ссылку на мод.
       </p>
     </section>
 
@@ -286,15 +286,30 @@
         <option value="dark">Тёмная</option>
         <option value="light">Светлая</option>
       </select>
-      <label class="row" style="margin-top:10px"><span>Шрифт (CSS)</span></label>
-      <input type="text" id="font-family" placeholder='system-ui, "Segoe UI", sans-serif' />
-      <label class="row" style="margin-top:10px"><span>Размер (px)</span></label>
-      <input type="number" id="font-size" min="10" max="22" />
-      <label class="row" style="margin-top:10px">
-        <span>Обложки в Discord</span>
+      <label class="row" style="margin-top:10px"><span>Шрифт</span></label>
+      <select id="font-family">
+        <option value="system-ui, sans-serif">Системный</option>
+        <option value="Arial, sans-serif">Arial</option>
+        <option value="Verdana, sans-serif">Verdana</option>
+        <option value="Trebuchet MS, sans-serif">Trebuchet MS</option>
+        <option value="Georgia, serif">Georgia</option>
+        <option value="Times New Roman, serif">Times New Roman</option>
+      </select>
+
+      <label class="row" style="margin-top:10px"><span>Размер шрифта</span></label>
+      <select id="font-size">
+        <option value="10">10px</option>
+        <option value="11">11px</option>
+        <option value="12">12px</option>
+        <option value="13">13px</option>
+        <option value="14">14px</option>
+        <option value="15">15px</option>
+        <option value="16">16px</option>
+      </select>
+      <label class="row" style="margin-top:10px"><span>Обложки в Discord</span>
         <input type="checkbox" id="cover-art" />
       </label>
-      <p class="hint">Для десктопного клиента обложки по URL недоступны — в Discord показывается запасной asset.</p>
+      <p class="hint">Обложки в Discord показываются только для десктопного клиента Яндекс.Музыки.</p>
       <div class="actions">
         <button type="button" class="primary" id="btn-save-look">Сохранить</button>
       </div>
@@ -398,12 +413,9 @@
           el.textContent = 'Не удалось связаться с RPC. Перезапустите приложение.';
           return;
         }
-        const idSrc = j.discordClientIdSource === 'env' ? 'свой (DISCORD_RPC_CLIENT_ID)' : 'встроенный в проект';
         el.innerHTML =
           '<strong>Discord:</strong> ' + (j.discordConnected ? 'подключён' : 'нет соединения') + '<br/>' +
-          '<strong>RPC вкл:</strong> ' + (j.rpcEnabled ? 'да' : 'нет') + '<br/>' +
-          '<strong>Application ID:</strong> ' + idSrc + '<br/>' +
-          '<strong>Порт:</strong> ' + j.port + '<br/>' +
+          '<strong>Состояние RPC:</strong> ' + (j.rpcEnabled ? 'Включен' : 'Выключен') + '<br/>' +
           '<strong>Конфиг:</strong> ' + (j.configDir || '—');
         applyNowPlayingToBar(j);
         try {
@@ -415,7 +427,7 @@
         } catch (_) {}
       } catch (e) {
         el.textContent =
-          'Нет связи с локальным RPC (порт 8765). Подождите пару секунд и нажмите «Обновить», либо перезапустите приложение. Убедитесь, что не запущена вторая копия процесса.';
+          'Нет связи с локальным RPC. Подождите пару секунд и нажмите «Обновить», либо перезапустите приложение. Убедитесь, что не запущена вторая копия процесса.';
       }
     }
 
@@ -423,8 +435,15 @@
       $('rpc-enabled').checked = cfg.rpcEnabled !== false;
       $('discord-show-mod-btn').checked = cfg.discordShowModButton !== false;
       $('theme').value = cfg.theme || 'dark';
-      $('font-family').value = cfg.fontFamily || '';
-      $('font-size').value = cfg.fontSizePx || 14;
+      const fontFamilySelect = $('font-family');
+      const savedFamily = (cfg.fontFamily || '').trim();
+      const familyExists = Array.from(fontFamilySelect.options).some((o) => o.value === savedFamily);
+      fontFamilySelect.value = familyExists ? savedFamily : 'system-ui, sans-serif';
+
+      const fontSizeSelect = $('font-size');
+      const savedSize = String(cfg.fontSizePx || 14);
+      const sizeExists = Array.from(fontSizeSelect.options).some((o) => o.value === savedSize);
+      fontSizeSelect.value = sizeExists ? savedSize : '14';
       $('cover-art').checked = cfg.coverArtEnabled !== false;
       const lm = (cfg.logging && cfg.logging.mode) || 'none';
       $('log-mode').value = lm;

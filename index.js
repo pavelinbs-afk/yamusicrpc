@@ -95,6 +95,8 @@ let lastGsmtcPollWallMs = null;
 let gsmtcPosStableSinceMs = null;
 /** Для полоски RPC в окне Electron */
 let lastNowPlaying = { title: '', artist: '' };
+/** Уже отправили в Discord режим «конец трека» без таймстампов (чтобы не блокировало DISCORD_UPDATE_INTERVAL_MS). */
+let lastDiscordTimelineAtEnd = false;
 
 const LOG_DIR = path.join(__dirname, 'logs');
 const LOG_PATH = path.join(LOG_DIR, 'discord-rpc.log');
@@ -342,6 +344,7 @@ function schedulePausedClear() {
         lastSentTrackKey = null;
         lastSentButtonUrl = null;
         lastNowPlaying = { title: '', artist: '' };
+        lastDiscordTimelineAtEnd = false;
         log('Статус сброшен: пауза без возобновления дольше', Math.round(PAUSED_CLEAR_MS / 60000), 'мин.');
       } catch (_) {}
     })();
@@ -470,11 +473,36 @@ async function setActivity(track, timestamps) {
   const details = discordClampText(title || 'Яндекс.Музыка', 128);
   const stateBase = [artist || '', album || ''].filter(Boolean).join(' — ');
   const state = stateBase ? discordClampText(stateBase, 128) : undefined;
+  const passed = timestamps || {};
+  const omitTimestamps = passed.omitTimestamps === true;
+  const img = pickLargeImage(track);
   try {
+    // На конце трека без следующего трека Discord зачёркивает таймер (end в прошлом).
+    // Не передаём start/end — остаётся название и обложка без «зависшей» полоски.
+    if (omitTimestamps) {
+      const payload = {
+        details,
+        state,
+        type: 2,
+        largeImageKey: img.key,
+        largeImageText: img.text,
+      };
+      if (trackUrl) {
+        applyDiscordButtonsToPayload(payload, trackUrl);
+        if (trackUrl !== lastSentButtonUrl) {
+          log('Кнопка в Discord:', trackUrl);
+          lastSentButtonUrl = trackUrl;
+        }
+      }
+      await rpc.setActivity(payload);
+      lastDiscordTimelineAtEnd = true;
+      log('Статус обновлён в Discord', `(${timePart || '—'})`, '(конец трека, без тайм‑бара)');
+      setIdleTimer();
+      return;
+    }
     // Если сервер уже посчитал абсолютные timestamps трека — используем их,
     // чтобы у всех зрителей Discord тайм‑бар был строго привязан к одному старту.
     const now = Date.now();
-    const passed = timestamps || {};
     const startedAtMs = typeof passed.startedAtMs === 'number' && Number.isFinite(passed.startedAtMs)
       ? passed.startedAtMs
       : now - elapsedSec * 1000;
@@ -484,7 +512,6 @@ async function setActivity(track, timestamps) {
     // Коррекция по UTC, чтобы у зрителей (другие ПК) тайм-бар совпадал с реальным воспроизведением
     const startAdjusted = startedAtMs - clockOffsetMs;
     const endAdjusted = endsAtMs != null ? endsAtMs - clockOffsetMs : undefined;
-    const img = pickLargeImage(track);
     const payload = {
       details,
       state,
@@ -541,11 +568,12 @@ async function setPausedActivity(track) {
   // Не вызывать setIdleTimer здесь: поллер шлёт паузу каждые ~2 с — таймер бы сбрасывался бесконечно.
 }
 
-async function clearActivity() {
+async function clearActivity(opts = {}) {
   if (!rpc) return;
+  const silent = opts && opts.silent === true;
   try {
     await rpc.clearActivity();
-    log('Статус сброшен.');
+    if (!silent) log('Статус сброшен.');
     lastSentButtonUrl = null;
   } catch (e) {
     logErr('clearActivity error', e && e.message ? e.message : String(e));
@@ -922,6 +950,7 @@ function runHttpServer() {
           lastGsmtcPollWallMs = null;
           gsmtcPosStableSinceMs = null;
           lastSentTrackKey = null;
+          lastDiscordTimelineAtEnd = false;
           res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
           // Если пришёл shutdown, завершаем процесс, чтобы новые POST от браузера
@@ -992,6 +1021,7 @@ function runHttpServer() {
               lastGsmtcRawPosSec = null;
               lastGsmtcPollWallMs = null;
               gsmtcPosStableSinceMs = null;
+              lastDiscordTimelineAtEnd = false;
             }
             res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, ignored: true, reason: 'yandex_idle_ui' }));
@@ -1016,6 +1046,7 @@ function runHttpServer() {
             lastGsmtcRawPosSec = null;
             lastGsmtcPollWallMs = null;
             gsmtcPosStableSinceMs = null;
+            lastDiscordTimelineAtEnd = false;
             res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true }));
             return;
@@ -1039,6 +1070,7 @@ function runHttpServer() {
 
           if (!currentTrackKey || key !== currentTrackKey) {
             currentTrackKey = key;
+            lastDiscordTimelineAtEnd = false;
             lastGsmtcRawPosSec = null;
             lastGsmtcPollWallMs = null;
             gsmtcPosStableSinceMs = null;
@@ -1152,6 +1184,12 @@ function runHttpServer() {
           const dForDisplay = durSec != null ? durSec : 0;
           const elapsedForDisplaySec = dForDisplay > 0 ? Math.min(pForDisplay, dForDisplay) : pForDisplay;
           const totalForDisplaySec = dForDisplay > 0 ? dForDisplay : Math.max(pForDisplay, dForDisplay);
+          const timelineAtEnd =
+            totalForDisplaySec > 0 &&
+            elapsedForDisplaySec >= totalForDisplaySec - 1;
+          if (!timelineAtEnd) {
+            lastDiscordTimelineAtEnd = false;
+          }
           const posStrLog = formatTime(elapsedForDisplaySec);
           const durStrLog = totalForDisplaySec > 0 ? formatTime(totalForDisplaySec) : null;
           const timePartLog = posStrLog && durStrLog ? `${posStrLog}/${durStrLog}` : (posStrLog || '—');
@@ -1181,8 +1219,13 @@ function runHttpServer() {
             if (lastSentTrackKey === '__paused__' && posSec != null) {
               currentTrackStart = now - posSec * 1000;
             }
-            // Зелёный таймер = время трека; обновляем раз в 0.5 сек
-            const canUpdate = key !== lastSentTrackKey || now - lastDiscordActivityAt >= DISCORD_UPDATE_INTERVAL_MS;
+            // Зелёный таймер = время трека; обновляем раз в 0.5 сек.
+            // На конце трека один раз принудительно шлём omitTimestamps — иначе троттлинг пропускает кадр и Discord остаётся с «просроченным» end.
+            const needTimelineEndFix = timelineAtEnd && !lastDiscordTimelineAtEnd;
+            const canUpdate =
+              key !== lastSentTrackKey ||
+              now - lastDiscordActivityAt >= DISCORD_UPDATE_INTERVAL_MS ||
+              needTimelineEndFix;
             if (canUpdate) {
               if (key !== lastSentTrackKey) {
                 log('DEBUG timing for activity:',
@@ -1190,7 +1233,12 @@ function runHttpServer() {
                   'endsAtMs=', endsAtMs != null ? Math.round(endsAtMs / 1000) : null
                 );
               }
-              setActivity(
+              if (needTimelineEndFix) {
+                try {
+                  await clearActivity({ silent: true });
+                } catch (_) {}
+              }
+              await setActivity(
                 {
                   title,
                   artist,
@@ -1200,7 +1248,11 @@ function runHttpServer() {
                   durationSec: effectiveDurSec != null ? effectiveDurSec : totalForDisplaySec,
                   url: trackUrl,
                 },
-                { startedAtMs: currentTrackStart, endsAtMs },
+                {
+                  startedAtMs: currentTrackStart,
+                  endsAtMs,
+                  omitTimestamps: timelineAtEnd,
+                },
               );
               lastSentTrackKey = key;
               lastDiscordActivityAt = now;

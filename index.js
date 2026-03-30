@@ -97,6 +97,8 @@ let gsmtcPosStableSinceMs = null;
 let lastNowPlaying = { title: '', artist: '' };
 /** Уже отправили в Discord режим «конец трека» без таймстампов (чтобы не блокировало DISCORD_UPDATE_INTERVAL_MS). */
 let lastDiscordTimelineAtEnd = false;
+/** После авто-сброса паузы блокируем повторный paused для этого же трека до resume/смены трека. */
+let pausedClearBlockedTrackKey = null;
 
 const LOG_DIR = path.join(__dirname, 'logs');
 const LOG_PATH = path.join(LOG_DIR, 'discord-rpc.log');
@@ -317,46 +319,73 @@ process.on('unhandledRejection', (reason) => {
   logErr('unhandledRejection', reason && reason.stack ? reason.stack : String(reason));
 });
 
-function clearIdleTimer() {
+function clearIdleTimerOnly() {
   if (idleTimer) {
     clearTimeout(idleTimer);
     idleTimer = null;
   }
+}
+
+function clearPausedClearTimerOnly() {
   if (pausedClearTimer) {
     clearTimeout(pausedClearTimer);
     pausedClearTimer = null;
   }
 }
 
+function clearAllPresenceTimers() {
+  clearIdleTimerOnly();
+  clearPausedClearTimerOnly();
+}
+
+function resetTrackSessionState() {
+  currentTrackKey = null;
+  currentTrackStart = null;
+  currentTrackDurationSec = null;
+  lastGsmtcRawPosSec = null;
+  lastGsmtcPollWallMs = null;
+  gsmtcPosStableSinceMs = null;
+  lastSentTrackKey = null;
+  lastSentButtonUrl = null;
+  lastDiscordActivityAt = 0;
+  lastNowPlaying = { title: '', artist: '' };
+  lastDiscordTimelineAtEnd = false;
+}
+
+async function clearActivityAndResetTrackSession(opts = {}) {
+  try {
+    await clearActivity(opts);
+  } catch (_) {}
+  resetTrackSessionState();
+}
+
+/** Таймаут «нет входящих /track с воспроизведением» — не привязывать к setActivity, иначе сброс никогда не наступит при залипшем треке. */
+function schedulePlayingIdleFromHttp() {
+  clearIdleTimerOnly();
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    (async () => {
+      try {
+        await clearActivityAndResetTrackSession({ silent: false });
+        log('Статус сброшен: нет данных о треке (воспроизведение) дольше', Math.round(IDLE_CLEAR_MS / 60000), 'мин.');
+      } catch (_) {}
+    })();
+  }, IDLE_CLEAR_MS);
+}
+
 function schedulePausedClear() {
-  clearIdleTimer();
+  const blockedKey = currentTrackKey || null;
+  clearAllPresenceTimers();
   pausedClearTimer = setTimeout(() => {
     pausedClearTimer = null;
     (async () => {
       try {
-        await clearActivity();
-        currentTrackKey = null;
-        currentTrackStart = null;
-        currentTrackDurationSec = null;
-        lastGsmtcRawPosSec = null;
-        lastGsmtcPollWallMs = null;
-        gsmtcPosStableSinceMs = null;
-        lastSentTrackKey = null;
-        lastSentButtonUrl = null;
-        lastNowPlaying = { title: '', artist: '' };
-        lastDiscordTimelineAtEnd = false;
+        await clearActivityAndResetTrackSession({ silent: false });
+        pausedClearBlockedTrackKey = blockedKey;
         log('Статус сброшен: пауза без возобновления дольше', Math.round(PAUSED_CLEAR_MS / 60000), 'мин.');
       } catch (_) {}
     })();
   }, PAUSED_CLEAR_MS);
-}
-
-function setIdleTimer() {
-  clearIdleTimer();
-  idleTimer = setTimeout(() => {
-    clearActivity();
-    idleTimer = null;
-  }, IDLE_CLEAR_MS);
 }
 
 /** Получает поправку к системным часам (NTP/UTC), чтобы тайм-бар в Discord совпадал у всех. */
@@ -497,7 +526,6 @@ async function setActivity(track, timestamps) {
       await rpc.setActivity(payload);
       lastDiscordTimelineAtEnd = true;
       log('Статус обновлён в Discord', `(${timePart || '—'})`, '(конец трека, без тайм‑бара)');
-      setIdleTimer();
       return;
     }
     // Если сервер уже посчитал абсолютные timestamps трека — используем их,
@@ -532,11 +560,10 @@ async function setActivity(track, timestamps) {
       }
     }
     await rpc.setActivity(payload);
-    log('Статус обновлён в Discord', `(${timePart || '—'})`, '(раз в 0.5 сек, тайм-бар = трек)');
+    log('Статус обновлён в Discord', `(${timePart || '—'})`, '(тайм-бар = трек, start/end)');
   } catch (e) {
     log('Ошибка setActivity:', e.message);
   }
-  setIdleTimer();
 }
 
 async function setPausedActivity(track) {
@@ -860,7 +887,7 @@ function runHttpServer() {
       (async () => {
         try {
           await clearActivity();
-          clearIdleTimer();
+          clearAllPresenceTimers();
         } catch (_) {}
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
@@ -942,15 +969,8 @@ function runHttpServer() {
           suppressUntilMs = msg.source === 'desktop' ? 0 : Date.now() + 15000;
           lastNowPlaying = { title: '', artist: '' };
           await clearActivity();
-          clearIdleTimer();
-          currentTrackKey = null;
-          currentTrackStart = null;
-          currentTrackDurationSec = null;
-          lastGsmtcRawPosSec = null;
-          lastGsmtcPollWallMs = null;
-          gsmtcPosStableSinceMs = null;
-          lastSentTrackKey = null;
-          lastDiscordTimelineAtEnd = false;
+          clearAllPresenceTimers();
+          resetTrackSessionState();
           res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
           // Если пришёл shutdown, завершаем процесс, чтобы новые POST от браузера
@@ -1014,14 +1034,8 @@ function runHttpServer() {
             // и лишняя нагрузка на Discord IPC. Сбрасываем только если до этого был активный трек.
             if (currentTrackKey) {
               await clearActivity();
-              clearIdleTimer();
-              currentTrackKey = null;
-              currentTrackStart = null;
-              currentTrackDurationSec = null;
-              lastGsmtcRawPosSec = null;
-              lastGsmtcPollWallMs = null;
-              gsmtcPosStableSinceMs = null;
-              lastDiscordTimelineAtEnd = false;
+              clearAllPresenceTimers();
+              resetTrackSessionState();
             }
             res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, ignored: true, reason: 'yandex_idle_ui' }));
@@ -1036,17 +1050,15 @@ function runHttpServer() {
           }
           const key = `${title} — ${artist}`.trim();
 
+          if (pausedClearBlockedTrackKey && key && key !== pausedClearBlockedTrackKey) {
+            pausedClearBlockedTrackKey = null;
+          }
+
           if (!key) {
             lastNowPlaying = { title: '', artist: '' };
             await clearActivity();
-            clearIdleTimer();
-            currentTrackKey = null;
-            currentTrackStart = null;
-            currentTrackDurationSec = null;
-            lastGsmtcRawPosSec = null;
-            lastGsmtcPollWallMs = null;
-            gsmtcPosStableSinceMs = null;
-            lastDiscordTimelineAtEnd = false;
+            clearAllPresenceTimers();
+            resetTrackSessionState();
             res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true }));
             return;
@@ -1128,43 +1140,62 @@ function runHttpServer() {
             durSec = dur;
             currentTrackDurationSec = dur;
 
-            const expectedSec =
+            const expectedForGlitch =
               currentTrackStart != null ? (now - currentTrackStart) / 1000 : raw;
-
-            if (lastGsmtcRawPosSec != null && Math.abs(raw - lastGsmtcRawPosSec) < 0.5) {
-              if (gsmtcPosStableSinceMs == null && lastGsmtcPollWallMs != null) {
-                gsmtcPosStableSinceMs = lastGsmtcPollWallMs;
-              }
-            } else {
-              gsmtcPosStableSinceMs = null;
-            }
-
-            const stale =
-              gsmtcPosStableSinceMs != null &&
-              now - gsmtcPosStableSinceMs >= 1200 &&
-              expectedSec > raw + 1.25;
-
-            /* Перемотка только по скачку сырой позиции между опросами; не сравнивать с expected — иначе цикл 0→4→сброс */
-            const seek =
-              !stale &&
+            const gsmtcJumpToStartAfterEnd =
+              dur > 0.5 &&
               lastGsmtcRawPosSec != null &&
-              Math.abs(raw - lastGsmtcRawPosSec) > 3.5;
+              lastGsmtcRawPosSec >= dur - 3 &&
+              raw < 3 &&
+              lastGsmtcRawPosSec - raw > 5 &&
+              expectedForGlitch >= dur - 2.5 &&
+              expectedForGlitch <= dur + 0.51;
 
-            if (stale) {
-              posSec = dur > 0
-                ? Math.min(Math.max(0, expectedSec), dur)
-                : Math.max(0, expectedSec);
-            } else if (seek) {
-              currentTrackStart = now - raw * 1000;
-              posSec = dur > 0 ? Math.min(raw, dur) : raw;
+            if (gsmtcJumpToStartAfterEnd) {
+              /* После конца трека GSMTC часто сбрасывает позицию в ~0 с тем же ключом трека — не новая перемотка. */
+              posSec = dur;
+              currentTrackStart = now - dur * 1000;
+              gsmtcPosStableSinceMs = null;
+              lastGsmtcRawPosSec = raw;
+              lastGsmtcPollWallMs = now;
             } else {
-              posSec = dur > 0
-                ? Math.min(Math.max(0, expectedSec), dur)
-                : Math.max(0, expectedSec);
-            }
+              const expectedSec = expectedForGlitch;
 
-            lastGsmtcRawPosSec = raw;
-            lastGsmtcPollWallMs = now;
+              if (lastGsmtcRawPosSec != null && Math.abs(raw - lastGsmtcRawPosSec) < 0.5) {
+                if (gsmtcPosStableSinceMs == null && lastGsmtcPollWallMs != null) {
+                  gsmtcPosStableSinceMs = lastGsmtcPollWallMs;
+                }
+              } else {
+                gsmtcPosStableSinceMs = null;
+              }
+
+              const stale =
+                gsmtcPosStableSinceMs != null &&
+                now - gsmtcPosStableSinceMs >= 1200 &&
+                expectedSec > raw + 1.25;
+
+              /* Перемотка только по скачку сырой позиции между опросами; не сравнивать с expected — иначе цикл 0→4→сброс */
+              const seek =
+                !stale &&
+                lastGsmtcRawPosSec != null &&
+                Math.abs(raw - lastGsmtcRawPosSec) > 3.5;
+
+              if (stale) {
+                posSec = dur > 0
+                  ? Math.min(Math.max(0, expectedSec), dur)
+                  : Math.max(0, expectedSec);
+              } else if (seek) {
+                currentTrackStart = now - raw * 1000;
+                posSec = dur > 0 ? Math.min(raw, dur) : raw;
+              } else {
+                posSec = dur > 0
+                  ? Math.min(Math.max(0, expectedSec), dur)
+                  : Math.max(0, expectedSec);
+              }
+
+              lastGsmtcRawPosSec = raw;
+              lastGsmtcPollWallMs = now;
+            }
           }
 
           // для таймера Discord и для текста — длительность; не используем durSec если он <= posSec (ошибка)
@@ -1182,11 +1213,18 @@ function runHttpServer() {
           // elapsed/total считаем из позиции/длительности трека, без привязки к таймстемпам
           const pForDisplay = posSec != null ? posSec : 0;
           const dForDisplay = durSec != null ? durSec : 0;
-          const elapsedForDisplaySec = dForDisplay > 0 ? Math.min(pForDisplay, dForDisplay) : pForDisplay;
+          let elapsedForDisplaySec = dForDisplay > 0 ? Math.min(pForDisplay, dForDisplay) : pForDisplay;
           const totalForDisplaySec = dForDisplay > 0 ? dForDisplay : Math.max(pForDisplay, dForDisplay);
+          const wallClockPastTrackEnd =
+            endsAtMs != null &&
+            now >= endsAtMs - 750;
+          if (wallClockPastTrackEnd && totalForDisplaySec > 0) {
+            elapsedForDisplaySec = totalForDisplaySec;
+          }
           const timelineAtEnd =
-            totalForDisplaySec > 0 &&
-            elapsedForDisplaySec >= totalForDisplaySec - 1;
+            wallClockPastTrackEnd ||
+            (totalForDisplaySec > 0 &&
+              elapsedForDisplaySec >= totalForDisplaySec - 1);
           if (!timelineAtEnd) {
             lastDiscordTimelineAtEnd = false;
           }
@@ -1196,24 +1234,33 @@ function runHttpServer() {
           log('Статус обновлён на сервере', `(${timePartLog})`, '(скорость обновления раз в 0.3 сек)');
 
           if (msg.paused) {
-            if (lastSentTrackKey !== '__paused__') {
-              schedulePausedClear();
+            if (pausedClearBlockedTrackKey && key === pausedClearBlockedTrackKey) {
+              if (lastSentTrackKey !== '__paused_blocked__') {
+                log('Пауза после авто-сброса: ожидаю возобновление/смену трека, не поднимаю статус повторно.');
+              }
+              lastSentTrackKey = '__paused_blocked__';
+              lastDiscordActivityAt = now;
+            } else {
+              if (lastSentTrackKey !== '__paused__') {
+                schedulePausedClear();
+              }
+              const durationForPauseSec = effectiveDurSec != null ? effectiveDurSec : durSec;
+              setPausedActivity({
+                title,
+                artist,
+                album,
+                coverUrl,
+                positionSec: posSec,
+                durationSec: durationForPauseSec,
+                url: trackUrl,
+              });
+              lastSentTrackKey = '__paused__';
+              lastDiscordActivityAt = now;
             }
-            const durationForPauseSec = effectiveDurSec != null ? effectiveDurSec : durSec;
-            setPausedActivity({
-              title,
-              artist,
-              album,
-              coverUrl,
-              positionSec: posSec,
-              durationSec: durationForPauseSec,
-              url: trackUrl,
-            });
-            lastSentTrackKey = '__paused__';
-            lastDiscordActivityAt = now;
           } else {
+            pausedClearBlockedTrackKey = null;
             if (lastSentTrackKey === '__paused__') {
-              clearIdleTimer();
+              clearPausedClearTimerOnly();
             }
             // Резум с паузы — пересчитываем currentTrackStart, чтобы таймер шёл с правильной позиции
             if (lastSentTrackKey === '__paused__' && posSec != null) {
@@ -1257,6 +1304,7 @@ function runHttpServer() {
               lastSentTrackKey = key;
               lastDiscordActivityAt = now;
             }
+            schedulePlayingIdleFromHttp();
           }
         }
       } catch (_) {
@@ -1292,6 +1340,7 @@ async function gracefulShutdown(reason, opts = {}) {
   } catch (e) {
     log('Ошибка при сбросе статуса:', e.message);
   }
+  clearAllPresenceTimers();
   if (process.env.RPC_EMBEDDED_IN_ELECTRON === '1') {
     if (!opts.fromElectronBeforeQuit) {
       try {

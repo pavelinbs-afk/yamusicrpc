@@ -1230,6 +1230,7 @@ function runHttpServer() {
             wallClockPastTrackEnd ||
             (totalForDisplaySec > 0 &&
               elapsedForDisplaySec >= totalForDisplaySec - 1);
+          const wasTimelineAtEnd = lastDiscordTimelineAtEnd;
           if (!timelineAtEnd) {
             lastDiscordTimelineAtEnd = false;
           }
@@ -1274,10 +1275,14 @@ function runHttpServer() {
             // Зелёный таймер = время трека; обновляем раз в 0.5 сек.
             // На конце трека один раз принудительно шлём omitTimestamps — иначе троттлинг пропускает кадр и Discord остаётся с «просроченным» end.
             const needTimelineEndFix = timelineAtEnd && !lastDiscordTimelineAtEnd;
+            // Важно для repeat: после режима "конец трека без timestamps" некоторые клиенты Discord
+            // могут залипнуть на зелёном elapsed. Перед возвратом тайм-бара делаем clearActivity.
+            const needTimelineRestoreFix = !timelineAtEnd && wasTimelineAtEnd;
             const canUpdate =
               key !== lastSentTrackKey ||
               now - lastDiscordActivityAt >= DISCORD_UPDATE_INTERVAL_MS ||
-              needTimelineEndFix;
+              needTimelineEndFix ||
+              needTimelineRestoreFix;
             if (canUpdate) {
               if (key !== lastSentTrackKey) {
                 log('DEBUG timing for activity:',
@@ -1286,6 +1291,11 @@ function runHttpServer() {
                 );
               }
               if (needTimelineEndFix) {
+                try {
+                  await clearActivity({ silent: true });
+                } catch (_) {}
+              }
+              if (needTimelineRestoreFix) {
                 try {
                   await clearActivity({ silent: true });
                 } catch (_) {}

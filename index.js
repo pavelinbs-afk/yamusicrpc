@@ -540,17 +540,22 @@ async function setActivity(track, timestamps) {
     // Коррекция по UTC, чтобы у зрителей (другие ПК) тайм-бар совпадал с реальным воспроизведением
     const startAdjusted = startedAtMs - clockOffsetMs;
     const endAdjusted = endsAtMs != null ? endsAtMs - clockOffsetMs : undefined;
+    const hasValidEnd = endAdjusted != null && Number.isFinite(endAdjusted);
     const payload = {
       details,
       state,
       // Listening (type=2) — чаще всего показывает тайм‑бар/прогресс,
       // в отличие от "Playing" (type=0), который может показывать countdown.
       type: 2,
-      startTimestamp: new Date(startAdjusted),
-      endTimestamp: endAdjusted != null && Number.isFinite(endAdjusted) ? new Date(endAdjusted) : undefined,
+      startTimestamp: hasValidEnd ? new Date(startAdjusted) : undefined,
+      endTimestamp: hasValidEnd ? new Date(endAdjusted) : undefined,
       largeImageKey: img.key,
       largeImageText: img.text,
     };
+    if (!hasValidEnd) {
+      // Не отправляем start без end: иначе Discord иногда показывает зелёный elapsed-таймер вместо тайм-бара.
+      log('DEBUG skip timestamps: no valid endTimestamp for this update');
+    }
     log('DEBUG payload type:', payload.type, 'endTimestamp?', !!payload.endTimestamp, 'startAdjusted=', Math.round(startAdjusted / 1000));
     if (trackUrl) {
       applyDiscordButtonsToPayload(payload, trackUrl);

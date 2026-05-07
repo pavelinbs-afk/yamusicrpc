@@ -69,7 +69,8 @@ const CLOCK_SYNC_INTERVAL_MS = 5 * 60 * 1000; // сверка часов раз 
 const IDLE_CLEAR_MS = 5 * 60 * 1000;
 /** Пауза: один раз при входе в паузу; не сбрасывать при каждом тике поллера */
 const PAUSED_CLEAR_MS = 5 * 60 * 1000;
-const DISCORD_UPDATE_INTERVAL_MS = 500; // обновление раз в 0.5 сек; зелёный таймер = время трека
+// Слишком частые setActivity повышают шанс, что Discord визуально "срывается" в зелёный elapsed.
+const DISCORD_UPDATE_INTERVAL_MS = 550; // компромисс: стабильнее тайм-бар и без заметной задержки
 
 let rpc = null;
 let idleTimer = null;
@@ -540,7 +541,11 @@ async function setActivity(track, timestamps) {
     // Коррекция по UTC, чтобы у зрителей (другие ПК) тайм-бар совпадал с реальным воспроизведением
     const startAdjusted = startedAtMs - clockOffsetMs;
     const endAdjusted = endsAtMs != null ? endsAtMs - clockOffsetMs : undefined;
-    const hasValidEnd = endAdjusted != null && Number.isFinite(endAdjusted);
+    const hasValidEnd =
+      endAdjusted != null &&
+      Number.isFinite(endAdjusted) &&
+      Number.isFinite(startAdjusted) &&
+      endAdjusted - startAdjusted >= 1500;
     const payload = {
       details,
       state,

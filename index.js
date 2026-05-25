@@ -59,7 +59,7 @@ function isYandexAppMarketingTitle(title, artist, album) {
 
 
 const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Открыть трек';
-const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Yandex Music Mod';
+const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Яндекс Музыка мод';
 const DISCORD_FIXED_MOD_BTN_URL = 'https://github.com/pavelinbs-afk/yamusicrpc';
 
 const HTTP_PORT = 8765;

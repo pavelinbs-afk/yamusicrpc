@@ -91,6 +91,42 @@ function Get-TimelineSeconds($session) {
   return @{ PositionSec = $posSec; DurationSec = $durSec }
 }
 
+function Save-ThumbnailToFile($props) {
+  try {
+    $thumb = $props.Thumbnail
+    if (-not $thumb) { return $null }
+    $streamOp = $thumb.OpenReadAsync()
+    $AsTask_IRandomAccessStreamWithContentType = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+      $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    } | Select-Object -First 1
+    if (-not $AsTask_IRandomAccessStreamWithContentType) { return $null }
+    $netTask = $AsTask_IRandomAccessStreamWithContentType.MakeGenericMethod([Windows.Storage.Streams.IRandomAccessStreamWithContentType]).Invoke($null, @($streamOp))
+    $null = $netTask.Wait(-1)
+    $stream = $netTask.Result
+    if (-not $stream) { return $null }
+    $size = $stream.Size
+    if ($size -le 0 -or $size -gt 5242880) { try { $stream.Dispose() } catch {}; return $null }
+    $reader = [Windows.Storage.Streams.DataReader]::new($stream.GetInputStreamAt(0))
+    $loadOp = $reader.LoadAsync([uint32]$size)
+    $AsTask_UInt32 = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+      $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    } | Select-Object -First 1
+    $netTask2 = $AsTask_UInt32.MakeGenericMethod([uint32]).Invoke($null, @($loadOp))
+    $null = $netTask2.Wait(-1)
+    $loaded = $netTask2.Result
+    if ($loaded -ne $size) { try { $stream.Dispose() } catch {}; return $null }
+    $bytes = [byte[]]::new($size)
+    $reader.ReadBytes($bytes)
+    $outPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'yandex-music-rpc-cover.png')
+    [System.IO.File]::WriteAllBytes($outPath, $bytes)
+    try { $reader.Dispose() } catch {}
+    try { $stream.Dispose() } catch {}
+    return $outPath
+  } catch {
+    return $null
+  }
+}
+
 $entries = [System.Collections.ArrayList]@()
 
 function Add-SessionEntry($session, [int]$baseRank) {
@@ -136,6 +172,7 @@ if ($entries.Count -eq 0) {
 $pick = $entries | Sort-Object { $_.Rank } -Descending | Select-Object -First 1
 $props = $pick.Props
 $time = Get-TimelineSeconds $pick.Session
+$coverPath = Save-ThumbnailToFile $props
 
 [PSCustomObject]@{
   ok           = $true
@@ -146,5 +183,6 @@ $time = Get-TimelineSeconds $pick.Session
   durationSec  = $time.DurationSec
   paused       = [bool]$pick.Paused
   source       = 'desktop'
+  coverPath    = if ($coverPath) { $coverPath } else { $null }
 } | ConvertTo-Json -Compress
 exit 0

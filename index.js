@@ -69,12 +69,19 @@ const CLOCK_SYNC_INTERVAL_MS = 5 * 60 * 1000; // сверка часов раз 
 const IDLE_CLEAR_MS = 5 * 60 * 1000;
 /** Пауза: один раз при входе в паузу; не сбрасывать при каждом тике поллера */
 const PAUSED_CLEAR_MS = 5 * 60 * 1000;
-// Слишком частые setActivity повышают шанс, что Discord визуально "срывается" в зелёный elapsed.
-const DISCORD_UPDATE_INTERVAL_MS = 550; // компромисс: стабильнее тайм-бар и без заметной задержки
+// Частые updatePresence могут приводить к очистке/залипанию RPC (discord-api-docs#668), поэтому
+// обычный playing-апдейт шлём редко: прогресс-бар анимируется на стороне Discord сам.
+const DISCORD_UPDATE_INTERVAL_MS = 900;
+// В paused-состоянии не нужно спамить одинаковым payload на каждом тике поллера.
+const DISCORD_PAUSED_UPDATE_INTERVAL_MS = 15000;
+/** Если Discord не отвечает на SET_ACTIVITY, иначе Promise висит навсегда и вся очередь RPC замирает. */
+const RPC_WRITE_TIMEOUT_MS = 15000;
 
 let rpc = null;
 let idleTimer = null;
 let pausedClearTimer = null;
+/** Последовательная очередь записей в Discord RPC (защита от гонок set/clear при частых POST). */
+let rpcWriteChain = Promise.resolve();
 let currentTrackKey = null;
 let currentTrackStart = null;
 let currentTrackDurationSec = null; // фиксируем длительность трека один раз при старте
@@ -84,6 +91,17 @@ let lastDiscordActivityAt = 0;
 let hasLoggedFirstMsg = false;
 /** Разница локальных часов и UTC в мс: localNow - realUtc. Коррекция таймштампов для Discord. */
 let clockOffsetMs = 0;
+/** Какой presence должен быть активен после реконнекта Discord RPC. */
+let desiredPresence = { kind: 'clear', track: null };
+let rpcTimeoutRecoveryInProgress = false;
+/** Для таймстампов Rich Presence: сбой worldtimeapi не должен уводить start/end на часы. */
+function clampedDiscordClockOffsetMs() {
+  if (!Number.isFinite(clockOffsetMs)) return 0;
+  const lim = 120000;
+  if (clockOffsetMs > lim) return lim;
+  if (clockOffsetMs < -lim) return -lim;
+  return clockOffsetMs;
+}
 let suppressUntilMs = 0;
 let discordReconnectInProgress = false;
 /** Для корректного выхода при встраивании в Electron (без второго процесса). */
@@ -94,12 +112,18 @@ let lastDesktopTrackKey = null;
 let lastGsmtcRawPosSec = null;
 let lastGsmtcPollWallMs = null;
 let gsmtcPosStableSinceMs = null;
+/** Кандидат на loop/repeat: подтверждаем только если сырой pos начинает стабильно расти. */
+let pendingLoopRestartRawSec = null;
+let pendingLoopRestartAtMs = null;
 /** Для полоски RPC в окне Electron */
 let lastNowPlaying = { title: '', artist: '' };
 /** Уже отправили в Discord режим «конец трека» без таймстампов (чтобы не блокировало DISCORD_UPDATE_INTERVAL_MS). */
 let lastDiscordTimelineAtEnd = false;
 /** После авто-сброса паузы блокируем повторный paused для этого же трека до resume/смены трека. */
 let pausedClearBlockedTrackKey = null;
+/** Последнее наблюдаемое положение таймлайна для детекта нового цикла repeat при том же key. */
+let lastObservedTimelineKey = null;
+let lastObservedElapsedSec = null;
 
 const LOG_DIR = path.join(__dirname, 'logs');
 const LOG_PATH = path.join(LOG_DIR, 'discord-rpc.log');
@@ -346,11 +370,15 @@ function resetTrackSessionState() {
   lastGsmtcRawPosSec = null;
   lastGsmtcPollWallMs = null;
   gsmtcPosStableSinceMs = null;
+  pendingLoopRestartRawSec = null;
+  pendingLoopRestartAtMs = null;
   lastSentTrackKey = null;
   lastSentButtonUrl = null;
   lastDiscordActivityAt = 0;
   lastNowPlaying = { title: '', artist: '' };
   lastDiscordTimelineAtEnd = false;
+  lastObservedTimelineKey = null;
+  lastObservedElapsedSec = null;
 }
 
 async function clearActivityAndResetTrackSession(opts = {}) {
@@ -425,6 +453,51 @@ function formatTime(sec) {
   return `${m}:${rs.toString().padStart(2, '0')}`;
 }
 
+function runSerializedRpcWrite(task) {
+  const gated = async () => {
+    let timer;
+    const timeout = new Promise((_, rej) => {
+      timer = setTimeout(() => rej(new Error('RPC_WRITE_TIMEOUT')), RPC_WRITE_TIMEOUT_MS);
+      if (timer.unref) timer.unref();
+    });
+    try {
+      return await Promise.race([Promise.resolve().then(task), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const next = rpcWriteChain.then(gated, gated);
+  rpcWriteChain = next.catch((e) => {
+    if (e && e.message === 'RPC_WRITE_TIMEOUT') {
+      logErr(
+        'Discord RPC: таймаут записи',
+        RPC_WRITE_TIMEOUT_MS,
+        'мс — запускаю переподключение RPC и восстановление статуса.',
+      );
+      forceRpcReconnectFromTimeout();
+    }
+    return undefined;
+  });
+  return next;
+}
+
+function forceRpcReconnectFromTimeout() {
+  if (rpcTimeoutRecoveryInProgress || rpcShutdownStarted) return;
+  rpcTimeoutRecoveryInProgress = true;
+  try {
+    const oldRpc = rpc;
+    rpc = null;
+    if (oldRpc) {
+      try { oldRpc.destroy(); } catch (_) {}
+    }
+    // Если предыдущий write завис, очередь уже сломана — начинаем чистую цепочку.
+    rpcWriteChain = Promise.resolve();
+    startDiscordReconnectLoop();
+  } finally {
+    setTimeout(() => { rpcTimeoutRecoveryInProgress = false; }, 2500);
+  }
+}
+
 function normalizeTrackUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return null;
   const u = rawUrl.trim();
@@ -454,6 +527,116 @@ function isAllowedCoverUrl(u) {
   }
 }
 
+/** Кеш обложек: key → { url, ts } */
+const coverCache = new Map();
+const COVER_CACHE_TTL_MS = 30 * 60 * 1000; // успешный результат — 30 минут
+const COVER_CACHE_NULL_TTL_MS = 30 * 1000; // null — 30 сек (ретрай при временном фейле)
+
+function finishParse(raw, resolve, cacheKey) {
+  try {
+    // Пробуем чистый JSON
+    let j;
+    try {
+      j = JSON.parse(raw);
+    } catch (_) {
+      // Стратегия 1: <script id="store-state" type="application/json">
+      let m = raw.match(/<script[^>]*\bid\s*=\s*["']store-state["'][^>]*>([\s\S]*?)<\/script>/i)
+           || raw.match(/<script[^>]*\btype\s*=\s*["']application\/json["'][^>]*>([\s\S]*?)<\/script>/i);
+      // Стратегия 2: window.__INITIAL_STATE__ = {...}
+      if (!m) m = raw.match(/window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\});/i);
+      // Стратегия 3: data-state="..."
+      if (!m) m = raw.match(/data-state\s*=\s*["'](\{[\s\S]*?\})["']/i);
+      if (m && m[1]) {
+        try { j = JSON.parse(m[1].trim().replace(/&quot;/g, '"')); } catch (_2) {}
+      }
+    }
+    if (!j) {
+      log('DEBUG cover parse FAIL:', { cacheKey, rawPrefix: raw.slice(0, 200) });
+      coverCache.set(cacheKey, { url: null, ts: Date.now() });
+      return resolve(null);
+    }
+    // Ищем первый трек с обложкой: проверяем несколько возможных путей
+    const items = (j.tracks && j.tracks.items) || [];
+    if (items.length > 0) {
+      for (const item of items) {
+        const uri = item.coverUri
+          || (item.albums && item.albums[0] && item.albums[0].coverUri)
+          || item.ogImage;
+        if (uri) {
+          const coverUrl = `https://${uri.replace(/^\/+/, '')}`;
+          log('DEBUG cover FOUND:', { cacheKey, coverUrl });
+          coverCache.set(cacheKey, { url: coverUrl, ts: Date.now() });
+          return resolve(coverUrl);
+        }
+      }
+    }
+    log('DEBUG cover: items found but no coverUri', { cacheKey, itemCount: items.length });
+    coverCache.set(cacheKey, { url: null, ts: Date.now() });
+    resolve(null);
+  } catch (_) {
+    coverCache.set(cacheKey, { url: null, ts: Date.now() });
+    resolve(null);
+  }
+}
+
+/**
+ * Ищет обложку трека: сначала парсит HTML страницы поиска (картинки в DOM),
+ * затем пробует API .jsx.
+ * Возвращает HTTPS-URL или null.
+ */
+function fetchCoverFromYandexApi(title, artist) {
+  const q = `${title} ${artist}`.trim();
+  if (!q) return Promise.resolve(null);
+  const cacheKey = q.toLowerCase();
+  const cached = coverCache.get(cacheKey);
+  if (cached) {
+    const ttl = cached.url ? COVER_CACHE_TTL_MS : COVER_CACHE_NULL_TTL_MS;
+    if (Date.now() - cached.ts < ttl) {
+      return Promise.resolve(cached.url);
+    }
+  }
+
+  const searchUrl = `https://music.yandex.ru/search?text=${encodeURIComponent(q)}`;
+
+  return new Promise((resolve) => {
+    // Метод 1: страница поиска — ищем avatars.yandex.net в HTML
+    const req = https.get(searchUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) YandexMusicRPC/1.0' },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        // Ищем URL обложек в HTML (img src, srcset, meta og:image)
+        const m = data.match(/avatars\.yandex\.net\/get-music-content\/[^\s"'>,;]+/i);
+        if (m) {
+          const coverUrl = `https://${m[0].replace(/[,;]+$/, '')}`;
+          log('DEBUG cover from search page:', { cacheKey, coverUrl });
+          coverCache.set(cacheKey, { url: coverUrl, ts: Date.now() });
+          return resolve(coverUrl);
+        }
+        // Метод 2: пробуем .jsx API
+        log('DEBUG cover: search page no match, trying API for', cacheKey);
+        tryApiSearch(q, cacheKey, resolve);
+      });
+    });
+    req.on('error', () => { tryApiSearch(q, cacheKey, resolve); });
+    req.setTimeout(5000, () => { req.destroy(); tryApiSearch(q, cacheKey, resolve); });
+  });
+}
+
+function tryApiSearch(q, cacheKey, resolve) {
+  const apiUrl = `https://music.yandex.ru/handlers/music-search.jsx?text=${encodeURIComponent(q)}&type=track&page=0`;
+  const req = https.get(apiUrl, {
+    headers: { 'User-Agent': 'YandexMusicRPC/1.0', 'Accept': 'application/json, text/plain, */*' },
+  }, (res) => {
+    let data = '';
+    res.on('data', (c) => { data += c; });
+    res.on('end', () => { finishParse(data, resolve, cacheKey); });
+  });
+  req.on('error', () => resolve(null));
+  req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+}
+
 function pickLargeImage(track) {
   const cover = track && track.coverUrl;
   if (runtimeConfig.coverArtEnabled && cover && isAllowedCoverUrl(cover)) {
@@ -463,6 +646,9 @@ function pickLargeImage(track) {
       128,
     );
     return { key: cover.slice(0, 512), text };
+  }
+  if (cover) {
+    log('DEBUG cover rejected:', { coverArtEnabled: runtimeConfig.coverArtEnabled, coverLen: cover.length, coverPrefix: cover.slice(0, 80) });
   }
   return { key: 'yandex_music_icon', text: 'Яндекс.Музыка' };
 }
@@ -488,8 +674,78 @@ function applyDiscordButtonsToPayload(payload, trackUrl) {
   }
 }
 
-async function setActivity(track, timestamps) {
+/**
+ * Таймстампы для Discord Listening (type=2): нужна пара start/end (см. discord-rpc #227, Lachee).
+ *
+ * Два режима: (1) стабильные start/end с сервера (`discordStartMs` / `discordEndMs` = сессия трека) —
+ * Discord интерполирует полоску между вызовами setActivity; постоянно пересчитывать start от
+ * `Date.now() − position` на каждом тике даёт «дёрганую» привязку и в ряде клиентов — залипание UI.
+ * (2) Если end уже в прошлом или якорь не сходится с позицией (repeat/баги) — fallback:
+ * `start = now − position`, `end = start + duration` с поджатием конца в будущее.
+ */
+function computeDiscordListeningTimestamps(elapsedSec, durationSec, nowMs, offsetMs) {
+  if (
+    !Number.isFinite(durationSec) ||
+    durationSec < 0.5 ||
+    !Number.isFinite(elapsedSec) ||
+    !Number.isFinite(nowMs) ||
+    !Number.isFinite(offsetMs)
+  ) {
+    return { startAdjusted: null, endAdjusted: null };
+  }
+  const durMs = Math.max(durationSec * 1000, 2000);
+  const posMs = Math.min(Math.max(0, elapsedSec * 1000), durMs);
+  const startLocal = nowMs - posMs;
+  const endLocal = startLocal + durMs;
+  const startAdjusted = startLocal - offsetMs;
+  const endAdjusted = endLocal - offsetMs;
+  if (!Number.isFinite(startAdjusted) || !Number.isFinite(endAdjusted)) {
+    return { startAdjusted: null, endAdjusted: null };
+  }
+  if (endAdjusted - startAdjusted < 1500) {
+    return { startAdjusted: null, endAdjusted: null };
+  }
+  return { startAdjusted, endAdjusted };
+}
+
+function resolveDiscordListeningTimestamps(track, elapsedSec, totalSec, nowMs, offsetMs) {
+  const s = track && track.discordStartMs;
+  const e = track && track.discordEndMs;
+  if (
+    typeof s === 'number' &&
+    typeof e === 'number' &&
+    Number.isFinite(s) &&
+    Number.isFinite(e) &&
+    Number.isFinite(offsetMs) &&
+    Number.isFinite(elapsedSec) &&
+    Number.isFinite(nowMs)
+  ) {
+    const durMs = e - s;
+    const startAdjusted = s - offsetMs;
+    const endAdjusted = e - offsetMs;
+    const nowAdj = nowMs - offsetMs;
+    if (durMs >= 1500 && endAdjusted > nowAdj + 400) {
+      const elapsedFromAnchorSec = (nowMs - s) / 1000;
+      const impliedStart = nowMs - elapsedSec * 1000;
+      /*
+       * Якорь currentTrackStart после repeat/багов GSMTC может жить своей жизнью: end ещё в будущем,
+       * но позиция из источника уже не совпадает с (now − start). Тогда сессионные timestamps
+       * «замораживают» полоску в Discord — сбрасываем на пересчёт от now+position.
+       */
+      if (
+        Math.abs(elapsedFromAnchorSec - elapsedSec) <= 3.25 &&
+        Math.abs(s - impliedStart) < 8000
+      ) {
+        return { startAdjusted, endAdjusted };
+      }
+    }
+  }
+  return computeDiscordListeningTimestamps(elapsedSec, totalSec, nowMs, offsetMs);
+}
+
+async function setActivity(track) {
   if (!rpc || !runtimeConfig.rpcEnabled) return;
+  desiredPresence = { kind: 'playing', track: { ...track } };
   const { title = '', artist = '', album = '', url: trackUrl, positionSec, durationSec } = track;
 
   const p = typeof positionSec === 'number' && Number.isFinite(positionSec) ? Math.max(0, positionSec) : 0;
@@ -503,49 +759,18 @@ async function setActivity(track, timestamps) {
   const details = discordClampText(title || 'Яндекс.Музыка', 128);
   const stateBase = [artist || '', album || ''].filter(Boolean).join(' — ');
   const state = stateBase ? discordClampText(stateBase, 128) : undefined;
-  const passed = timestamps || {};
-  const omitTimestamps = passed.omitTimestamps === true;
   const img = pickLargeImage(track);
   try {
-    // На конце трека без следующего трека Discord зачёркивает таймер (end в прошлом).
-    // Не передаём start/end — остаётся название и обложка без «зависшей» полоски.
-    if (omitTimestamps) {
-      const payload = {
-        details,
-        state,
-        type: 2,
-        largeImageKey: img.key,
-        largeImageText: img.text,
-      };
-      if (trackUrl) {
-        applyDiscordButtonsToPayload(payload, trackUrl);
-        if (trackUrl !== lastSentButtonUrl) {
-          log('Кнопка в Discord:', trackUrl);
-          lastSentButtonUrl = trackUrl;
-        }
-      }
-      await rpc.setActivity(payload);
-      lastDiscordTimelineAtEnd = true;
-      log('Статус обновлён в Discord', `(${timePart || '—'})`, '(конец трека, без тайм‑бара)');
-      return;
-    }
-    // Если сервер уже посчитал абсолютные timestamps трека — используем их,
-    // чтобы у всех зрителей Discord тайм‑бар был строго привязан к одному старту.
     const now = Date.now();
-    const startedAtMs = typeof passed.startedAtMs === 'number' && Number.isFinite(passed.startedAtMs)
-      ? passed.startedAtMs
-      : now - elapsedSec * 1000;
-    const endsAtMs = typeof passed.endsAtMs === 'number' && Number.isFinite(passed.endsAtMs)
-      ? passed.endsAtMs
-      : (totalSec > 0 ? startedAtMs + totalSec * 1000 : undefined);
-    // Коррекция по UTC, чтобы у зрителей (другие ПК) тайм-бар совпадал с реальным воспроизведением
-    const startAdjusted = startedAtMs - clockOffsetMs;
-    const endAdjusted = endsAtMs != null ? endsAtMs - clockOffsetMs : undefined;
-    const hasValidEnd =
-      endAdjusted != null &&
-      Number.isFinite(endAdjusted) &&
-      Number.isFinite(startAdjusted) &&
-      endAdjusted - startAdjusted >= 1500;
+    const off = clampedDiscordClockOffsetMs();
+    const { startAdjusted, endAdjusted } = resolveDiscordListeningTimestamps(
+      track,
+      elapsedSec,
+      totalSec,
+      now,
+      off,
+    );
+    const hasValidEnd = startAdjusted != null && endAdjusted != null;
     const payload = {
       details,
       state,
@@ -558,10 +783,8 @@ async function setActivity(track, timestamps) {
       largeImageText: img.text,
     };
     if (!hasValidEnd) {
-      // Не отправляем start без end: иначе Discord иногда показывает зелёный elapsed-таймер вместо тайм-бара.
-      log('DEBUG skip timestamps: no valid endTimestamp for this update');
+      log('DEBUG skip timestamps: нет валидной пары start/end для Discord');
     }
-    log('DEBUG payload type:', payload.type, 'endTimestamp?', !!payload.endTimestamp, 'startAdjusted=', Math.round(startAdjusted / 1000));
     if (trackUrl) {
       applyDiscordButtonsToPayload(payload, trackUrl);
       if (trackUrl !== lastSentButtonUrl) {
@@ -569,7 +792,7 @@ async function setActivity(track, timestamps) {
         lastSentButtonUrl = trackUrl;
       }
     }
-    await rpc.setActivity(payload);
+    await runSerializedRpcWrite(() => rpc.setActivity(payload));
     log('Статус обновлён в Discord', `(${timePart || '—'})`, '(тайм-бар = трек, start/end)');
   } catch (e) {
     log('Ошибка setActivity:', e.message);
@@ -578,6 +801,7 @@ async function setActivity(track, timestamps) {
 
 async function setPausedActivity(track) {
   if (!rpc || !runtimeConfig.rpcEnabled) return;
+  desiredPresence = { kind: 'paused', track: { ...track } };
   const { title = '', artist = '', positionSec, durationSec, url: trackUrl } = track;
   const mainLine = [title || '', artist || ''].filter(Boolean).join(' — ');
   const stateText = discordClampText(mainLine || 'Яндекс.Музыка', 128);
@@ -597,7 +821,7 @@ async function setPausedActivity(track) {
         lastSentButtonUrl = trackUrl;
       }
     }
-    await rpc.setActivity(payload);
+    await runSerializedRpcWrite(() => rpc.setActivity(payload));
     log('Статус обновлён в Discord (пауза)', stateText || '—');
   } catch (e) {
     log('Ошибка setActivity (пауза):', e.message);
@@ -606,15 +830,34 @@ async function setPausedActivity(track) {
 }
 
 async function clearActivity(opts = {}) {
+  desiredPresence = { kind: 'clear', track: null };
   if (!rpc) return;
   const silent = opts && opts.silent === true;
   try {
-    await rpc.clearActivity();
+    await runSerializedRpcWrite(() => rpc.clearActivity());
     if (!silent) log('Статус сброшен.');
     lastSentButtonUrl = null;
   } catch (e) {
     logErr('clearActivity error', e && e.message ? e.message : String(e));
     log('Ошибка clearActivity:', e.message);
+  }
+}
+
+async function restoreDesiredPresenceAfterReconnect() {
+  if (!rpc || !runtimeConfig.rpcEnabled) return;
+  const snap = desiredPresence || { kind: 'clear', track: null };
+  try {
+    if (snap.kind === 'playing' && snap.track) {
+      await setActivity(snap.track);
+      return;
+    }
+    if (snap.kind === 'paused' && snap.track) {
+      await setPausedActivity(snap.track);
+      return;
+    }
+    await clearActivity({ silent: true });
+  } catch (e) {
+    logErr('restoreDesiredPresenceAfterReconnect error', e && e.message ? e.message : String(e));
   }
 }
 
@@ -676,6 +919,7 @@ async function connectDiscordWithRetry() {
     attempt += 1;
     try {
       await initDiscordRpc(20000);
+      await restoreDesiredPresenceAfterReconnect();
       // keep process alive; HTTP server already running
       return;
     } catch (e) {
@@ -791,6 +1035,7 @@ async function desktopPollOnce() {
           positionSec: hasTimeline ? pos : undefined,
           durationSec: hasTimeline ? dur : undefined,
           paused: g.paused === true,
+          coverPath: typeof g.coverPath === 'string' ? g.coverPath : undefined,
         };
       }
     }
@@ -863,6 +1108,7 @@ function startDesktopPoller() {
         album: typeof data.album === 'string' ? data.album : '',
         source: 'desktop',
         paused: data.paused === true,
+        coverPath: data.coverPath,
       };
       if (typeof data.positionSec === 'number' && Number.isFinite(data.positionSec)) {
         payload.positionSec = data.positionSec;
@@ -1037,7 +1283,18 @@ function runHttpServer() {
             return;
           }
           const album = msg.album || '';
-          const coverUrl = typeof msg.coverUrl === 'string' ? msg.coverUrl.trim() : '';
+          let coverUrl = typeof msg.coverUrl === 'string' ? msg.coverUrl.trim() : '';
+          // Для десктопа без готового URL — ищем обложку через API Яндекс.Музыки (HTTPS).
+          // НЕ делаем await — чтобы не блокировать обработчик трека и детект повтора.
+          if (!coverUrl && src === 'desktop' && title) {
+            const cached = coverCache.get(`${title} ${artist}`.toLowerCase());
+            if (cached && cached.url && Date.now() - cached.ts < COVER_CACHE_TTL_MS) {
+              coverUrl = cached.url;
+            } else {
+              // Запускаем фоновый запрос; результат подхватится на следующем тике из кеша
+              fetchCoverFromYandexApi(title, artist);
+            }
+          }
           if (src === 'desktop' && isYandexAppMarketingTitle(title, artist, album)) {
             lastNowPlaying = { title: '', artist: '' };
             // Не вызывать clearActivity на каждом тике поллера (2 с), иначе спам «Статус сброшен»
@@ -1096,6 +1353,8 @@ function runHttpServer() {
             lastGsmtcRawPosSec = null;
             lastGsmtcPollWallMs = null;
             gsmtcPosStableSinceMs = null;
+            pendingLoopRestartRawSec = null;
+            pendingLoopRestartAtMs = null;
             log('Добавлен трек:', title, artist || '(без названия)');
             if (Object.prototype.hasOwnProperty.call(msg, 'url')) {
               log(
@@ -1133,6 +1392,7 @@ function runHttpServer() {
           }
 
           /* Десктоп без таймлайна GSMTC: время по локальным часам; длительность — оценка из конфига. */
+          let gsmtcDidResetToStart = false;
           if (src === 'desktop' && !gsmtcTimeline) {
             if (currentTrackStart != null) {
               posSec = Math.floor((Date.now() - currentTrackStart) / 1000);
@@ -1159,16 +1419,40 @@ function runHttpServer() {
               raw < 3 &&
               lastGsmtcRawPosSec - raw > 5 &&
               expectedForGlitch >= dur - 2.5 &&
-              expectedForGlitch <= dur + 0.51;
+              expectedForGlitch <= dur + 10;
 
             if (gsmtcJumpToStartAfterEnd) {
-              /* После конца трека GSMTC часто сбрасывает позицию в ~0 с тем же ключом трека — не новая перемотка. */
-              posSec = dur;
-              currentTrackStart = now - dur * 1000;
+              /*
+               * Прыжок с конца в начало — повтор трека.
+               * Сразу сбрасываем позицию и currentTrackStart на реальное значение raw (~0),
+               * чтобы таймер перезапустился с 00:00, а не завис на конце.
+               * pendingLoopRestart* оставлен как страховка от GSMTC-глитчей.
+               */
+              pendingLoopRestartRawSec = raw;
+              pendingLoopRestartAtMs = now;
+              posSec = raw;
+              currentTrackStart = now - raw * 1000;
+              gsmtcDidResetToStart = true;
               gsmtcPosStableSinceMs = null;
               lastGsmtcRawPosSec = raw;
               lastGsmtcPollWallMs = now;
             } else {
+              const loopRestartConfirmed =
+                pendingLoopRestartAtMs != null &&
+                pendingLoopRestartRawSec != null &&
+                now - pendingLoopRestartAtMs <= 3000 &&
+                raw >= pendingLoopRestartRawSec + 0.8;
+              if (loopRestartConfirmed) {
+                currentTrackStart = now - raw * 1000;
+                pendingLoopRestartRawSec = null;
+                pendingLoopRestartAtMs = null;
+              } else if (pendingLoopRestartAtMs != null && now - pendingLoopRestartAtMs > 3000) {
+                pendingLoopRestartRawSec = null;
+                pendingLoopRestartAtMs = null;
+                // Таймаут подтверждения повтора: сбрасываем currentTrackStart,
+                // чтобы позиция не залипла на конце трека навсегда.
+                currentTrackStart = now - raw * 1000;
+              }
               const expectedSec = expectedForGlitch;
 
               if (lastGsmtcRawPosSec != null && Math.abs(raw - lastGsmtcRawPosSec) < 0.5) {
@@ -1191,12 +1475,26 @@ function runHttpServer() {
                 Math.abs(raw - lastGsmtcRawPosSec) > 3.5;
 
               if (stale) {
-                posSec = dur > 0
-                  ? Math.min(Math.max(0, expectedSec), dur)
-                  : Math.max(0, expectedSec);
+                // Если GSMTC залип на 0, а стенные часы ушли за длительность —
+                // симулируем повтор трека: позиция = остаток от деления (expectedSec % dur)
+                if (raw < 1 && dur > 0.5 && expectedSec > dur + 0.5) {
+                  const loopPos = expectedSec % dur;
+                  if (loopPos < 5) {
+                    // Только что пересекли границу цикла — форсируем апдейт Discord
+                    gsmtcDidResetToStart = true;
+                  }
+                  posSec = loopPos;
+                  currentTrackStart = now - posSec * 1000;
+                } else {
+                  posSec = dur > 0
+                    ? Math.min(Math.max(0, expectedSec), dur)
+                    : Math.max(0, expectedSec);
+                }
               } else if (seek) {
                 currentTrackStart = now - raw * 1000;
                 posSec = dur > 0 ? Math.min(raw, dur) : raw;
+                // Сброс позиции через seek (скачок > 3.5 сек) на начало — повтор трека
+                if (raw < dur - 10) gsmtcDidResetToStart = true;
               } else {
                 posSec = dur > 0
                   ? Math.min(Math.max(0, expectedSec), dur)
@@ -1205,6 +1503,18 @@ function runHttpServer() {
 
               lastGsmtcRawPosSec = raw;
               lastGsmtcPollWallMs = now;
+              // DEBUG: сводка GSMTC-тика
+              log('GSMTC tick:', {
+                raw: raw.toFixed(1),
+                dur,
+                posSec: posSec != null ? posSec.toFixed(1) : 'null',
+                expectedSec: expectedSec != null ? expectedSec.toFixed(1) : 'null',
+                jump: gsmtcJumpToStartAfterEnd,
+                seek,
+                stale,
+                didReset: gsmtcDidResetToStart,
+                pendingAge: pendingLoopRestartAtMs ? (now - pendingLoopRestartAtMs) : null,
+              });
             }
           }
 
@@ -1225,9 +1535,42 @@ function runHttpServer() {
           const dForDisplay = durSec != null ? durSec : 0;
           let elapsedForDisplaySec = dForDisplay > 0 ? Math.min(pForDisplay, dForDisplay) : pForDisplay;
           const totalForDisplaySec = dForDisplay > 0 ? dForDisplay : Math.max(pForDisplay, dForDisplay);
+          const cycleRestartDetected =
+            !msg.paused &&
+            totalForDisplaySec > 8 &&
+            lastObservedTimelineKey === key &&
+            typeof lastObservedElapsedSec === 'number' &&
+            lastObservedElapsedSec >= totalForDisplaySec - 18 &&
+            elapsedForDisplaySec <= 5;
+          if (cycleRestartDetected && Number.isFinite(pForDisplay)) {
+            currentTrackStart = now - pForDisplay * 1000;
+            if (effectiveDurSec != null && Number.isFinite(effectiveDurSec)) {
+              endsAtMs = currentTrackStart + effectiveDurSec * 1000;
+            }
+            lastDiscordTimelineAtEnd = false;
+          }
+          /*
+           * Если по часам «уже после endsAtMs», а сырая позиция в начале трека — endsAtMs
+           * относится к прошлому циклу repeat. Иначе wallClockPastTrackEnd залипает true,
+           * timelineAtEnd не сбрасывается и Discord перестаёт нормально обновляться.
+           */
+          const staleEndWhileAtTrackStart =
+            !msg.paused &&
+            totalForDisplaySec > 15 &&
+            pForDisplay < 12 &&
+            endsAtMs != null &&
+            now >= endsAtMs - 500;
+          if (staleEndWhileAtTrackStart && Number.isFinite(pForDisplay) && effectiveDurSec != null) {
+            currentTrackStart = now - pForDisplay * 1000;
+            endsAtMs = currentTrackStart + effectiveDurSec * 1000;
+            lastDiscordTimelineAtEnd = false;
+          }
+          const positionSaysNearEnd =
+            totalForDisplaySec <= 0 || pForDisplay >= totalForDisplaySec - 18;
           const wallClockPastTrackEnd =
             endsAtMs != null &&
-            now >= endsAtMs - 750;
+            now >= endsAtMs - 120 &&
+            positionSaysNearEnd;
           if (wallClockPastTrackEnd && totalForDisplaySec > 0) {
             elapsedForDisplaySec = totalForDisplaySec;
           }
@@ -1252,21 +1595,26 @@ function runHttpServer() {
               lastSentTrackKey = '__paused_blocked__';
               lastDiscordActivityAt = now;
             } else {
+              const shouldUpdatePaused =
+                lastSentTrackKey !== '__paused__' ||
+                now - lastDiscordActivityAt >= DISCORD_PAUSED_UPDATE_INTERVAL_MS;
               if (lastSentTrackKey !== '__paused__') {
                 schedulePausedClear();
               }
-              const durationForPauseSec = effectiveDurSec != null ? effectiveDurSec : durSec;
-              setPausedActivity({
-                title,
-                artist,
-                album,
-                coverUrl,
-                positionSec: posSec,
-                durationSec: durationForPauseSec,
-                url: trackUrl,
-              });
-              lastSentTrackKey = '__paused__';
-              lastDiscordActivityAt = now;
+              if (shouldUpdatePaused) {
+                const durationForPauseSec = effectiveDurSec != null ? effectiveDurSec : durSec;
+                await setPausedActivity({
+                  title,
+                  artist,
+                  album,
+                  coverUrl,
+                  positionSec: posSec,
+                  durationSec: durationForPauseSec,
+                  url: trackUrl,
+                });
+                lastSentTrackKey = '__paused__';
+                lastDiscordActivityAt = now;
+              }
             }
           } else {
             pausedClearBlockedTrackKey = null;
@@ -1277,17 +1625,30 @@ function runHttpServer() {
             if (lastSentTrackKey === '__paused__' && posSec != null) {
               currentTrackStart = now - posSec * 1000;
             }
-            // Зелёный таймер = время трека; обновляем раз в 0.5 сек.
-            // На конце трека один раз принудительно шлём omitTimestamps — иначе троттлинг пропускает кадр и Discord остаётся с «просроченным» end.
+            // Первый кадр «конец трека» — форсим обновление (троттлинг), без omitTimestamps:
+            // в setActivity конец сдвигается в будущее, чтобы не было «просроченного» end.
             const needTimelineEndFix = timelineAtEnd && !lastDiscordTimelineAtEnd;
             // Важно для repeat: после режима "конец трека без timestamps" некоторые клиенты Discord
             // могут залипнуть на зелёном elapsed. Перед возвратом тайм-бара делаем clearActivity.
             const needTimelineRestoreFix = !timelineAtEnd && wasTimelineAtEnd;
+            const needCycleRestartFix = cycleRestartDetected;
             const canUpdate =
               key !== lastSentTrackKey ||
               now - lastDiscordActivityAt >= DISCORD_UPDATE_INTERVAL_MS ||
               needTimelineEndFix ||
-              needTimelineRestoreFix;
+              needTimelineRestoreFix ||
+              needCycleRestartFix ||
+              gsmtcDidResetToStart;
+            if (!canUpdate && !msg.paused) {
+              log('DEBUG throttled:', {
+                elapsed: elapsedForDisplaySec.toFixed(1),
+                total: totalForDisplaySec,
+                sinceLast: now - lastDiscordActivityAt,
+                cycleRestart: cycleRestartDetected,
+                gsmtcReset: gsmtcDidResetToStart,
+                lastObserved: lastObservedElapsedSec != null ? lastObservedElapsedSec.toFixed(1) : 'null',
+              });
+            }
             if (canUpdate) {
               if (key !== lastSentTrackKey) {
                 log('DEBUG timing for activity:',
@@ -1295,37 +1656,36 @@ function runHttpServer() {
                   'endsAtMs=', endsAtMs != null ? Math.round(endsAtMs / 1000) : null
                 );
               }
-              if (needTimelineEndFix) {
+              if (needTimelineRestoreFix || needCycleRestartFix || gsmtcDidResetToStart) {
                 try {
                   await clearActivity({ silent: true });
                 } catch (_) {}
               }
-              if (needTimelineRestoreFix) {
-                try {
-                  await clearActivity({ silent: true });
-                } catch (_) {}
+              await setActivity({
+                title,
+                artist,
+                album,
+                coverUrl,
+                positionSec: elapsedForDisplaySec,
+                durationSec: effectiveDurSec != null ? effectiveDurSec : totalForDisplaySec,
+                url: trackUrl,
+                discordStartMs:
+                  currentTrackStart != null && Number.isFinite(currentTrackStart)
+                    ? currentTrackStart
+                    : undefined,
+                discordEndMs:
+                  endsAtMs != null && Number.isFinite(endsAtMs) ? endsAtMs : undefined,
+              });
+              if (timelineAtEnd) {
+                lastDiscordTimelineAtEnd = true;
               }
-              await setActivity(
-                {
-                  title,
-                  artist,
-                  album,
-                  coverUrl,
-                  positionSec: elapsedForDisplaySec,
-                  durationSec: effectiveDurSec != null ? effectiveDurSec : totalForDisplaySec,
-                  url: trackUrl,
-                },
-                {
-                  startedAtMs: currentTrackStart,
-                  endsAtMs,
-                  omitTimestamps: timelineAtEnd,
-                },
-              );
               lastSentTrackKey = key;
               lastDiscordActivityAt = now;
             }
             schedulePlayingIdleFromHttp();
           }
+          lastObservedTimelineKey = key || null;
+          lastObservedElapsedSec = elapsedForDisplaySec;
         }
       } catch (_) {
         log('Неверный формат сообщения.');

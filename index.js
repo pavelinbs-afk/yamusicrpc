@@ -59,11 +59,11 @@ function isYandexAppMarketingTitle(title, artist, album) {
 
 
 const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Открыть трек';
-const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Яндекс Музыка мод';
+const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Яндекс Музыка Мод';
 const DISCORD_FIXED_MOD_BTN_URL = 'https://github.com/pavelinbs-afk/yamusicrpc';
 
 const HTTP_PORT = 8765;
-const CLOCK_SYNC_URL = 'https://worldtimeapi.org/api/timezone/Etc/UTC';
+const CLOCK_SYNC_URL = 'https://worldtimeapi.org/api/timezone/Etc/UTC'; 
 const CLOCK_SYNC_INTERVAL_MS = 5 * 60 * 1000; // сверка часов раз в 5 минут
 /** Нет входящих обновлений трека (приложение закрыто и т.п.) — сброс статуса */
 const IDLE_CLEAR_MS = 5 * 60 * 1000;
@@ -1285,14 +1285,18 @@ function runHttpServer() {
           const album = msg.album || '';
           let coverUrl = typeof msg.coverUrl === 'string' ? msg.coverUrl.trim() : '';
           // Для десктопа без готового URL — ищем обложку через API Яндекс.Музыки (HTTPS).
-          // НЕ делаем await — чтобы не блокировать обработчик трека и детект повтора.
           if (!coverUrl && src === 'desktop' && title) {
-            const cached = coverCache.get(`${title} ${artist}`.toLowerCase());
+            const cacheKey = `${title} ${artist}`.toLowerCase();
+            const cached = coverCache.get(cacheKey);
             if (cached && cached.url && Date.now() - cached.ts < COVER_CACHE_TTL_MS) {
               coverUrl = cached.url;
             } else {
-              // Запускаем фоновый запрос; результат подхватится на следующем тике из кеша
-              fetchCoverFromYandexApi(title, artist);
+              // Гонка: ждём до 400 мс — если API успел, обложка в этом же тике
+              const pending = fetchCoverFromYandexApi(title, artist);
+              coverUrl = (await Promise.race([
+                pending,
+                new Promise((r) => setTimeout(() => r(null), 400)),
+              ])) || '';
             }
           }
           if (src === 'desktop' && isYandexAppMarketingTitle(title, artist, album)) {

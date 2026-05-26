@@ -596,10 +596,14 @@ function fetchCoverFromYandexApi(title, artist) {
     }
   }
 
+  return fetchCoverWithRetries(q, cacheKey, 3);
+}
+
+/** Пытаемся достать обложку из поисковой страницы, с повторами при неудаче. */
+function fetchCoverWithRetries(q, cacheKey, retriesLeft) {
   const searchUrl = `https://music.yandex.ru/search?text=${encodeURIComponent(q)}`;
 
   return new Promise((resolve) => {
-    // Метод 1: страница поиска — ищем avatars.yandex.net в HTML
     const req = https.get(searchUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) YandexMusicRPC/1.0' },
     }, (res) => {
@@ -609,18 +613,43 @@ function fetchCoverFromYandexApi(title, artist) {
         // Ищем URL обложек в HTML (img src, srcset, meta og:image)
         const m = data.match(/avatars\.yandex\.net\/get-music-content\/[^\s"'>,;]+/i);
         if (m) {
-          const coverUrl = `https://${m[0].replace(/[,;]+$/, '')}`;
+          let coverUrl = `https://${m[0].replace(/[,;]+$/, '')}`;
+          coverUrl = coverUrl.replace(/\/\d+x\d+(?=\/|$)/, '/400x400');
           log('DEBUG cover from search page:', { cacheKey, coverUrl });
           coverCache.set(cacheKey, { url: coverUrl, ts: Date.now() });
           return resolve(coverUrl);
         }
-        // Метод 2: пробуем .jsx API
-        log('DEBUG cover: search page no match, trying API for', cacheKey);
-        tryApiSearch(q, cacheKey, resolve);
+        // Не нашли — ретрай или фолбек на API
+        if (retriesLeft > 0) {
+          log('DEBUG cover retry:', { cacheKey, retriesLeft });
+          setTimeout(() => {
+            fetchCoverWithRetries(q, cacheKey, retriesLeft - 1).then(resolve);
+          }, 1500);
+        } else {
+          log('DEBUG cover: search page no match, trying API for', cacheKey);
+          tryApiSearch(q, cacheKey, resolve);
+        }
       });
     });
-    req.on('error', () => { tryApiSearch(q, cacheKey, resolve); });
-    req.setTimeout(5000, () => { req.destroy(); tryApiSearch(q, cacheKey, resolve); });
+    req.on('error', () => {
+      if (retriesLeft > 0) {
+        setTimeout(() => {
+          fetchCoverWithRetries(q, cacheKey, retriesLeft - 1).then(resolve);
+        }, 1500);
+      } else {
+        tryApiSearch(q, cacheKey, resolve);
+      }
+    });
+    req.setTimeout(5000, () => {
+      req.destroy();
+      if (retriesLeft > 0) {
+        setTimeout(() => {
+          fetchCoverWithRetries(q, cacheKey, retriesLeft - 1).then(resolve);
+        }, 1500);
+      } else {
+        tryApiSearch(q, cacheKey, resolve);
+      }
+    });
   });
 }
 

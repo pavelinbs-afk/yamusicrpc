@@ -827,15 +827,40 @@ function fetchCoverFromYandexApi(title, artist) {
     warmupYandexSession();
   }
 
-  const promise = fetchCoverWithRetries(q, cacheKey, Date.now() + 20000)
-    .then((yandexResult) => {
-      if (yandexResult) return yandexResult;
-      // Яндекс не дал обложку — пробуем Deezer
-      return fetchCoverFromDeezerApi(title, artist, cacheKey);
-    })
-    .finally(() => {
-      pendingCoverFetches.delete(cacheKey);
-    });
+  const promise = (async () => {
+    // Запускаем Яндекс и Deezer параллельно
+    const yandexPromise = fetchCoverWithRetries(q, cacheKey, Date.now() + 20000);
+    const deezerPromise = fetchCoverFromDeezerApi(title, artist, cacheKey);
+
+    // Ждём первый успешный результат
+    const result = await Promise.race([
+      yandexPromise.then((url) => url ? { url, source: 'yandex' } : null),
+      deezerPromise.then((url) => url ? { url, source: 'deezer' } : null),
+    ]);
+
+    if (result) {
+      // Если победил Deezer, но Яндекс ещё не завершился — даём Яндексу шанс
+      // перезаписать кеш (Яндекс-обложки аутентичнее)
+      if (result.source === 'deezer') {
+        yandexPromise.then((yandexUrl) => {
+          if (yandexUrl) {
+            log('DEBUG cover: Deezer was first, but Yandex found cover too — updating cache for', cacheKey);
+            coverCacheSetSafe(cacheKey, yandexUrl, Date.now());
+          }
+        }).catch(() => {});
+      }
+      return result.url;
+    }
+
+    // Оба не вернули результат сразу — ждём оставшийся
+    const yandexResult = await yandexPromise;
+    if (yandexResult) return yandexResult;
+
+    const deezerResult = await deezerPromise;
+    return deezerResult;
+  })().finally(() => {
+    pendingCoverFetches.delete(cacheKey);
+  });
   pendingCoverFetches.set(cacheKey, promise);
   return promise;
 }

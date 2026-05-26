@@ -520,7 +520,8 @@ function isAllowedCoverUrl(u) {
       host.endsWith('yandex.net') ||
       host.endsWith('yandex.com') ||
       host.endsWith('yandex.by') ||
-      host.endsWith('yandex.kz')
+      host.endsWith('yandex.kz') ||
+      host.endsWith('dzcdn.net')       // Deezer CDN
     );
   } catch (_) {
     return false;
@@ -529,6 +530,30 @@ function isAllowedCoverUrl(u) {
 
 /** Хранилище сессионных кук для Яндекс.Музыки (один сессионный jar на все запросы) */
 const yandexCookieJar = new Map();
+let yandexSessionWarmedUp = false;
+
+/** «Прогрев» сессии: заходим на главную Яндекс.Музыки, получаем куки */
+function warmupYandexSession() {
+  if (yandexSessionWarmedUp) return Promise.resolve();
+  return httpsGetWithRedirects('https://music.yandex.ru/', {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ru-RU,ru;q=0.9',
+  }, 5).then(({ statusCode, data }) => {
+    yandexSessionWarmedUp = true;
+    log('DEBUG yandex session warmup:', statusCode, 'bodyLen:', data.length);
+    // Если ответ не капча — сессия установлена успешно
+    if (!data.includes('showcaptcha') && !data.includes('Вы не робот')) {
+      log('DEBUG yandex session warmup OK');
+    } else {
+      log('DEBUG yandex session warmup got captcha, will retry later');
+      yandexSessionWarmedUp = false;
+    }
+  }).catch((e) => {
+    log('DEBUG yandex session warmup error:', e.message);
+    yandexSessionWarmedUp = false;
+  });
+}
 
 /**
  * HTTPS GET с автоматическим следованием редиректам (до maxRedirects) и сбором кук.
@@ -775,8 +800,8 @@ function finishParse(raw, resolve, cacheKey) {
 }
 
 /**
- * Ищет обложку трека: сначала парсит HTML страницы поиска (картинки в DOM),
- * затем пробует API .jsx.
+ * Ищет обложку трека: сначала Яндекс (поисковая страница + API),
+ * при неудаче — Deezer API (публичный, без авторизации).
  * Возвращает HTTPS-URL или null.
  */
 function fetchCoverFromYandexApi(title, artist) {
@@ -797,14 +822,76 @@ function fetchCoverFromYandexApi(title, artist) {
     return inFlight;
   }
 
-  const promise = fetchCoverWithRetries(q, cacheKey, Date.now() + 30000).finally(() => {
-    pendingCoverFetches.delete(cacheKey);
-  });
+  // Прогреваем сессию Яндекса при первой возможности
+  if (!yandexSessionWarmedUp) {
+    warmupYandexSession();
+  }
+
+  const promise = fetchCoverWithRetries(q, cacheKey, Date.now() + 20000)
+    .then((yandexResult) => {
+      if (yandexResult) return yandexResult;
+      // Яндекс не дал обложку — пробуем Deezer
+      return fetchCoverFromDeezerApi(title, artist, cacheKey);
+    })
+    .finally(() => {
+      pendingCoverFetches.delete(cacheKey);
+    });
   pendingCoverFetches.set(cacheKey, promise);
   return promise;
 }
 
-/** Пытаемся достать обложку из поисковой страницы. Повторяем каждые 2 сек, пока не истечёт deadline (30 сек от старта трека). */
+/** Фолбек: поиск обложки через публичное API Deezer */
+function fetchCoverFromDeezerApi(title, artist, cacheKey) {
+  const q = encodeURIComponent(`${title} ${artist}`.trim());
+  const url = `https://api.deezer.com/search?q=${q}&limit=1`;
+
+  return new Promise((resolve) => {
+    const req = https.get(url, {
+      headers: { 'User-Agent': 'YandexMusicRPC/2.0' },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          log('DEBUG deezer API status:', res.statusCode);
+          resolve(null);
+          return;
+        }
+        try {
+          const j = JSON.parse(data);
+          const track = j.data && j.data[0];
+          const coverUrl = track && track.album && track.album.cover_big;
+          if (coverUrl && /^https?:\/\//i.test(coverUrl)) {
+            log('DEBUG cover from Deezer:', { cacheKey, coverUrl });
+            coverCacheSetSafe(cacheKey, coverUrl, Date.now());
+            resolve(coverUrl);
+          } else {
+            log('DEBUG deezer: no cover in response for', cacheKey);
+            coverCacheSetSafe(cacheKey, null, Date.now());
+            resolve(null);
+          }
+        } catch (_) {
+          log('DEBUG deezer parse error for', cacheKey);
+          coverCacheSetSafe(cacheKey, null, Date.now());
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', (e) => {
+      log('DEBUG deezer API error:', e.message);
+      coverCacheSetSafe(cacheKey, null, Date.now());
+      resolve(null);
+    });
+    req.setTimeout(5000, () => {
+      req.destroy();
+      log('DEBUG deezer API timeout for', cacheKey);
+      coverCacheSetSafe(cacheKey, null, Date.now());
+      resolve(null);
+    });
+  });
+}
+
+/** Пытаемся достать обложку из поисковой страницы. Повторяем каждые 5 сек, пока не истечёт deadline (20 сек от старта трека). */
 function fetchCoverWithRetries(q, cacheKey, deadline, attemptNum) {
   const attempt = attemptNum || 0;
   const searchUrl = `https://music.yandex.ru/search?text=${encodeURIComponent(q)}`;
@@ -822,7 +909,7 @@ function fetchCoverWithRetries(q, cacheKey, deadline, attemptNum) {
           if (Date.now() < deadline) {
             const left = Math.round((deadline - Date.now()) / 1000);
             log('DEBUG cover retry (captcha):', { cacheKey, secLeft: left, status: statusCode });
-            setTimeout(() => fetchCoverWithRetries(q, cacheKey, deadline, attempt + 1).then(resolve), 2000);
+            setTimeout(() => fetchCoverWithRetries(q, cacheKey, deadline, attempt + 1).then(resolve), 5000);
           } else {
             log('DEBUG cover: deadline expired (captcha loop), trying API for', cacheKey);
             tryApiSearch(q, cacheKey, resolve);
@@ -859,7 +946,7 @@ function fetchCoverWithRetries(q, cacheKey, deadline, attemptNum) {
         if (Date.now() < deadline) {
           const left = Math.round((deadline - Date.now()) / 1000);
           log('DEBUG cover retry:', { cacheKey, secLeft: left, status: statusCode });
-          setTimeout(() => fetchCoverWithRetries(q, cacheKey, deadline, attempt + 1).then(resolve), 2000);
+          setTimeout(() => fetchCoverWithRetries(q, cacheKey, deadline, attempt + 1).then(resolve), 5000);
         } else {
           log('DEBUG cover: deadline expired, trying API for', cacheKey);
           tryApiSearch(q, cacheKey, resolve);
@@ -868,7 +955,7 @@ function fetchCoverWithRetries(q, cacheKey, deadline, attemptNum) {
       .catch((e) => {
         log('DEBUG cover search error:', e.message);
         if (Date.now() < deadline) {
-          setTimeout(() => fetchCoverWithRetries(q, cacheKey, deadline, attempt + 1).then(resolve), 2000);
+          setTimeout(() => fetchCoverWithRetries(q, cacheKey, deadline, attempt + 1).then(resolve), 5000);
         } else {
           tryApiSearch(q, cacheKey, resolve);
         }

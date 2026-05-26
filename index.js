@@ -527,54 +527,249 @@ function isAllowedCoverUrl(u) {
   }
 }
 
+/** Хранилище сессионных кук для Яндекс.Музыки (один сессионный jar на все запросы) */
+const yandexCookieJar = new Map();
+
+/**
+ * HTTPS GET с автоматическим следованием редиректам (до maxRedirects) и сбором кук.
+ * Возвращает Promise<{ statusCode, data, finalUrl }>.
+ */
+function httpsGetWithRedirects(url, headers, maxRedirects) {
+  const max = maxRedirects || 5;
+  return new Promise((resolve, reject) => {
+    // Собираем куки в заголовок Cookie
+    const cookieHeader = Array.from(yandexCookieJar.entries())
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ');
+    const reqHeaders = { ...headers };
+    if (cookieHeader) reqHeaders['Cookie'] = cookieHeader;
+
+    function doRequest(currentUrl, redirectsLeft) {
+      const req = https.get(currentUrl, { headers: reqHeaders }, (res) => {
+        // Сохраняем куки из ответа
+        const setCookie = res.headers['set-cookie'];
+        if (setCookie && Array.isArray(setCookie)) {
+          for (const c of setCookie) {
+            const parts = c.split(';')[0].split('=');
+            if (parts.length === 2) {
+              const key = parts[0].trim();
+              const val = parts[1].trim();
+              if (!['Domain', 'Path', 'Expires', 'Max-Age', 'Secure', 'HttpOnly', 'SameSite'].includes(key)) {
+                yandexCookieJar.set(key, val);
+              }
+            }
+          }
+        }
+
+        // Редирект?
+        if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) && redirectsLeft > 0) {
+          const loc = res.headers.location;
+          if (loc) {
+            // Коротко дренируем тело ответа
+            res.resume();
+            // Строим абсолютный URL если location относительный
+            let nextUrl = loc;
+            if (loc.startsWith('/')) {
+              const u = new URL(currentUrl);
+              nextUrl = `${u.protocol}//${u.host}${loc}`;
+            } else if (!loc.startsWith('http')) {
+              const u = new URL(currentUrl);
+              nextUrl = `${u.protocol}//${u.host}/${loc}`;
+            }
+            return doRequest(nextUrl, redirectsLeft - 1);
+          }
+        }
+
+        // Не редирект — собираем тело
+        let data = '';
+        res.on('data', (c) => { data += c; });
+        res.on('end', () => resolve({ statusCode: res.statusCode, data, finalUrl: currentUrl }));
+      });
+      req.on('error', (e) => reject(e));
+      req.setTimeout(8000, () => { req.destroy(); reject(new Error('timeout')); });
+    }
+
+    doRequest(url, max);
+  });
+}
+
 /** Кеш обложек: key → { url, ts } */
 const coverCache = new Map();
 const COVER_CACHE_TTL_MS = 30 * 60 * 1000; // успешный результат — 30 минут
 const COVER_CACHE_NULL_TTL_MS = 30 * 1000; // null — 30 сек (ретрай при временном фейле)
 
+/** Дедупликация одновременных запросов обложек: key → Promise */
+const pendingCoverFetches = new Map();
+
+/** Установить URL в кеш (без перезаписи валидного url на null) */
+function coverCacheSetSafe(cacheKey, url, ts) {
+  if (url) {
+    coverCache.set(cacheKey, { url, ts });
+    return;
+  }
+  // Не перезаписываем валидный кеш null'ом
+  const existing = coverCache.get(cacheKey);
+  if (existing && existing.url && Date.now() - existing.ts < COVER_CACHE_TTL_MS) {
+    return;
+  }
+  coverCache.set(cacheKey, { url: null, ts });
+}
+
+/**
+ * Извлекает сбалансированный JSON-объект начиная с позиции startPos.
+ * Отслеживает глубину скобок и состояние кавычек.
+ */
+function extractBalancedJson(str, startPos) {
+  const openIdx = str.indexOf('{', startPos);
+  if (openIdx === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = openIdx; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return str.slice(openIdx, i + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * Ищет coverUri во вложенных полях объекта (рекурсивно, но с ограничением глубины).
+ * Возвращает первый найденный URI или null.
+ */
+function findCoverUriInJson(obj, maxDepth) {
+  if (!obj || typeof obj !== 'object' || maxDepth <= 0) return null;
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const r = findCoverUriInJson(item, maxDepth - 1);
+      if (r) return r;
+    }
+    return null;
+  }
+  // Прямые поля
+  const direct = obj.coverUri || obj.ogImage;
+  if (typeof direct === 'string' && direct.trim()) return direct.trim();
+  // Вложенные альбомы
+  if (obj.albums && Array.isArray(obj.albums) && obj.albums[0]) {
+    const albumCover = obj.albums[0].coverUri || obj.albums[0].ogImage;
+    if (typeof albumCover === 'string' && albumCover.trim()) return albumCover.trim();
+  }
+  // Обходим значения
+  for (const val of Object.values(obj)) {
+    if (val && typeof val === 'object') {
+      const r = findCoverUriInJson(val, maxDepth - 1);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
 function finishParse(raw, resolve, cacheKey) {
   try {
-    // Пробуем чистый JSON
     let j;
+    // Пробуем чистый JSON
     try {
       j = JSON.parse(raw);
     } catch (_) {
       // Стратегия 1: <script id="store-state" type="application/json">
       let m = raw.match(/<script[^>]*\bid\s*=\s*["']store-state["'][^>]*>([\s\S]*?)<\/script>/i)
            || raw.match(/<script[^>]*\btype\s*=\s*["']application\/json["'][^>]*>([\s\S]*?)<\/script>/i);
-      // Стратегия 2: window.__INITIAL_STATE__ = {...}
-      if (!m) m = raw.match(/window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\});/i);
-      // Стратегия 3: data-state="..."
-      if (!m) m = raw.match(/data-state\s*=\s*["'](\{[\s\S]*?\})["']/i);
+
+      // Стратегия 2: window.__INITIAL_STATE__ = {...} — ищем сбалансированный JSON
+      if (!m) {
+        const initMatch = raw.match(/window\.__INITIAL_STATE__\s*=\s*/);
+        if (initMatch) {
+          const json = extractBalancedJson(raw, initMatch.index + initMatch[0].length);
+          if (json) m = ['__init__', json];
+        }
+      }
+
+      // Стратегия 3: data-state="..." — сбалансированный JSON
+      if (!m) {
+        const dsMatch = raw.match(/data-state\s*=\s*["']/i);
+        if (dsMatch) {
+          const json = extractBalancedJson(raw, dsMatch.index + dsMatch[0].length);
+          if (json) m = ['__datastate__', json];
+        }
+      }
+
+      // Стратегия 4: window.__PRELOADED_STATE__ = {...}
+      if (!m) {
+        const psMatch = raw.match(/window\.__PRELOADED_STATE__\s*=\s*/);
+        if (psMatch) {
+          const json = extractBalancedJson(raw, psMatch.index + psMatch[0].length);
+          if (json) m = ['__preloaded__', json];
+        }
+      }
+
       if (m && m[1]) {
         try { j = JSON.parse(m[1].trim().replace(/&quot;/g, '"')); } catch (_2) {}
       }
     }
-    if (!j) {
-      log('DEBUG cover parse FAIL:', { cacheKey, rawPrefix: raw.slice(0, 200) });
-      coverCache.set(cacheKey, { url: null, ts: Date.now() });
-      return resolve(null);
-    }
-    // Ищем первый трек с обложкой: проверяем несколько возможных путей
-    const items = (j.tracks && j.tracks.items) || [];
-    if (items.length > 0) {
-      for (const item of items) {
-        const uri = item.coverUri
-          || (item.albums && item.albums[0] && item.albums[0].coverUri)
-          || item.ogImage;
-        if (uri) {
-          const coverUrl = `https://${uri.replace(/^\/+/, '')}`;
-          log('DEBUG cover FOUND:', { cacheKey, coverUrl });
-          coverCache.set(cacheKey, { url: coverUrl, ts: Date.now() });
-          return resolve(coverUrl);
+
+    if (j) {
+      // Ищем coverUri в JSON — сначала items, потом рекурсивно во всём объекте
+      let uri = null;
+      const items = (j.tracks && j.tracks.items) || [];
+      if (items.length > 0) {
+        for (const item of items) {
+          uri = item.coverUri
+            || (item.albums && item.albums[0] && item.albums[0].coverUri)
+            || item.ogImage;
+          if (uri) break;
         }
       }
+      if (!uri) {
+        uri = findCoverUriInJson(j, 8);
+      }
+      if (uri) {
+        const coverUrl = `https://${uri.replace(/^\/+/, '')}`;
+        log('DEBUG cover FOUND:', { cacheKey, coverUrl });
+        coverCacheSetSafe(cacheKey, coverUrl, Date.now());
+        return resolve(coverUrl);
+      }
+      log('DEBUG cover: JSON parsed but no coverUri found', { cacheKey });
     }
-    log('DEBUG cover: items found but no coverUri', { cacheKey, itemCount: items.length });
-    coverCache.set(cacheKey, { url: null, ts: Date.now() });
+
+    // Фолбек: ищем coverUri или og:image прямо в сыром HTML
+    const htmlCoverMatch = raw.match(/coverUri["']?\s*:\s*["']([^"']+\.(?:jpg|png|jpeg|webp)[^"']*)/i)
+      || raw.match(/["']coverUri["']\s*:\s*["']([^"']+)["']/i)
+      || raw.match(/<meta\s+[^>]*property\s*=\s*["']og:image["'][^>]*content\s*=\s*["']([^"']+)["'][^>]*\/?>/i)
+      || raw.match(/<meta\s+[^>]*content\s*=\s*["']([^"']+)["'][^>]*property\s*=\s*["']og:image["'][^>]*\/?>/i);
+    if (htmlCoverMatch && htmlCoverMatch[1]) {
+      let coverUrl = htmlCoverMatch[1].trim();
+      if (coverUrl.startsWith('//')) coverUrl = 'https:' + coverUrl;
+      else if (!/^https?:\/\//i.test(coverUrl)) coverUrl = 'https://' + coverUrl.replace(/^\/+/, '');
+      // Заменяем размер на 600x600 для единообразия
+      coverUrl = coverUrl.replace(/\/\d+x\d+(?=\/|$)/, '/600x600');
+      if (isAllowedCoverUrl(coverUrl)) {
+        log('DEBUG cover from HTML fallback:', { cacheKey, coverUrl });
+        coverCacheSetSafe(cacheKey, coverUrl, Date.now());
+        return resolve(coverUrl);
+      }
+    }
+
+    log('DEBUG cover parse FAIL:', { cacheKey, rawLen: raw.length, rawPrefix: raw.slice(0, 200) });
+    coverCacheSetSafe(cacheKey, null, Date.now());
     resolve(null);
   } catch (_) {
-    coverCache.set(cacheKey, { url: null, ts: Date.now() });
+    coverCacheSetSafe(cacheKey, null, Date.now());
     resolve(null);
   }
 }
@@ -596,74 +791,147 @@ function fetchCoverFromYandexApi(title, artist) {
     }
   }
 
-  return fetchCoverWithRetries(q, cacheKey, 3);
+  // Дедупликация: если запрос для этого же cacheKey уже в процессе — ждём его
+  const inFlight = pendingCoverFetches.get(cacheKey);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const promise = fetchCoverWithRetries(q, cacheKey, Date.now() + 30000).finally(() => {
+    pendingCoverFetches.delete(cacheKey);
+  });
+  pendingCoverFetches.set(cacheKey, promise);
+  return promise;
 }
 
-/** Пытаемся достать обложку из поисковой страницы, с повторами при неудаче. */
-function fetchCoverWithRetries(q, cacheKey, retriesLeft) {
+/** Пытаемся достать обложку из поисковой страницы. Повторяем каждые 2 сек, пока не истечёт deadline (30 сек от старта трека). */
+function fetchCoverWithRetries(q, cacheKey, deadline, attemptNum) {
+  const attempt = attemptNum || 0;
   const searchUrl = `https://music.yandex.ru/search?text=${encodeURIComponent(q)}`;
+  const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) YandexMusicRPC/2.0' };
 
   return new Promise((resolve) => {
-    const req = https.get(searchUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) YandexMusicRPC/1.0' },
-    }, (res) => {
-      let data = '';
-      res.on('data', (c) => { data += c; });
-      res.on('end', () => {
-        // Ищем URL обложек в HTML (img src, srcset, meta og:image)
-        const m = data.match(/avatars\.yandex\.net\/get-music-content\/[^\s"'>,;]+/i);
-        if (m) {
-          let coverUrl = `https://${m[0].replace(/[,;]+$/, '')}`;
-          coverUrl = coverUrl.replace(/\/\d+x\d+(?=\/|$)/, '/400x400');
-          log('DEBUG cover from search page:', { cacheKey, coverUrl });
-          coverCache.set(cacheKey, { url: coverUrl, ts: Date.now() });
-          return resolve(coverUrl);
+    httpsGetWithRedirects(searchUrl, headers, 5)
+      .then(({ statusCode, data }) => {
+        if (attempt === 0) {
+          log('DEBUG cover search page #0 status:', statusCode, 'bodyLen:', data.length, 'prefix:', data.slice(0, 300));
         }
-        // Не нашли — ретрай или фолбек на API
-        if (retriesLeft > 0) {
-          log('DEBUG cover retry:', { cacheKey, retriesLeft });
-          setTimeout(() => {
-            fetchCoverWithRetries(q, cacheKey, retriesLeft - 1).then(resolve);
-          }, 1500);
+
+        // Проверяем не капча ли
+        if (data.includes('showcaptcha') || data.includes('captcha')) {
+          if (Date.now() < deadline) {
+            const left = Math.round((deadline - Date.now()) / 1000);
+            log('DEBUG cover retry (captcha):', { cacheKey, secLeft: left, status: statusCode });
+            setTimeout(() => fetchCoverWithRetries(q, cacheKey, deadline, attempt + 1).then(resolve), 2000);
+          } else {
+            log('DEBUG cover: deadline expired (captcha loop), trying API for', cacheKey);
+            tryApiSearch(q, cacheKey, resolve);
+          }
+          return;
+        }
+
+        // Ищем URL обложки в HTML
+        let m = data.match(/avatars\.(?:yandex\.net|yandex\.ru|mds\.yandex\.net)\/get-music-content\/[^\s"'><]+/i);
+        if (!m) {
+          m = data.match(/<meta\s+[^>]*property\s*=\s*["']og:image["'][^>]*content\s*=\s*["']([^"']+)["'][^>]*\/?>/i)
+           || data.match(/<meta\s+[^>]*content\s*=\s*["']([^"']+)["'][^>]*property\s*=\s*["']og:image["'][^>]*\/?>/i);
+        }
+        if (!m) {
+          m = data.match(/https?:\/\/avatars\.(?:yandex\.net|yandex\.ru)\/[^\s"'><]+/i);
+        }
+
+        if (m) {
+          let coverUrl;
+          if (m[1] !== undefined) {
+            coverUrl = m[1].trim();
+          } else {
+            coverUrl = m[0].replace(/[,;]+$/, '');
+          }
+          if (!/^https?:\/\//i.test(coverUrl)) coverUrl = 'https://' + coverUrl.replace(/^\/+/, '');
+          coverUrl = coverUrl.replace(/\/\d+x\d+(?=\/|$)/, '/600x600');
+          if (isAllowedCoverUrl(coverUrl)) {
+            log('DEBUG cover from search page:', { cacheKey, coverUrl });
+            coverCacheSetSafe(cacheKey, coverUrl, Date.now());
+            return resolve(coverUrl);
+          }
+        }
+
+        if (Date.now() < deadline) {
+          const left = Math.round((deadline - Date.now()) / 1000);
+          log('DEBUG cover retry:', { cacheKey, secLeft: left, status: statusCode });
+          setTimeout(() => fetchCoverWithRetries(q, cacheKey, deadline, attempt + 1).then(resolve), 2000);
         } else {
-          log('DEBUG cover: search page no match, trying API for', cacheKey);
+          log('DEBUG cover: deadline expired, trying API for', cacheKey);
+          tryApiSearch(q, cacheKey, resolve);
+        }
+      })
+      .catch((e) => {
+        log('DEBUG cover search error:', e.message);
+        if (Date.now() < deadline) {
+          setTimeout(() => fetchCoverWithRetries(q, cacheKey, deadline, attempt + 1).then(resolve), 2000);
+        } else {
           tryApiSearch(q, cacheKey, resolve);
         }
       });
-    });
-    req.on('error', () => {
-      if (retriesLeft > 0) {
-        setTimeout(() => {
-          fetchCoverWithRetries(q, cacheKey, retriesLeft - 1).then(resolve);
-        }, 1500);
-      } else {
-        tryApiSearch(q, cacheKey, resolve);
-      }
-    });
-    req.setTimeout(5000, () => {
-      req.destroy();
-      if (retriesLeft > 0) {
-        setTimeout(() => {
-          fetchCoverWithRetries(q, cacheKey, retriesLeft - 1).then(resolve);
-        }, 1500);
-      } else {
-        tryApiSearch(q, cacheKey, resolve);
-      }
-    });
   });
 }
 
 function tryApiSearch(q, cacheKey, resolve) {
   const apiUrl = `https://music.yandex.ru/handlers/music-search.jsx?text=${encodeURIComponent(q)}&type=track&page=0`;
-  const req = https.get(apiUrl, {
-    headers: { 'User-Agent': 'YandexMusicRPC/1.0', 'Accept': 'application/json, text/plain, */*' },
-  }, (res) => {
-    let data = '';
-    res.on('data', (c) => { data += c; });
-    res.on('end', () => { finishParse(data, resolve, cacheKey); });
-  });
-  req.on('error', () => resolve(null));
-  req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) YandexMusicRPC/2.0',
+    'Accept': 'application/json, text/plain, */*',
+    'Referer': 'https://music.yandex.ru/search',
+    'Accept-Language': 'ru-RU,ru;q=0.9',
+  };
+
+  httpsGetWithRedirects(apiUrl, headers, 3)
+    .then(({ statusCode, data }) => {
+      if (statusCode === 200 && data.length > 100) {
+        finishParse(data, (result) => {
+          if (result) {
+            resolve(result);
+          } else {
+            log('DEBUG cover: .jsx parsed but no coverUri, bodyLen:', data.length);
+            tryDirectTrackPage(q, cacheKey, resolve);
+          }
+        }, cacheKey);
+      } else {
+        log('DEBUG cover: .jsx API status', statusCode, 'bodyLen:', data.length);
+        tryDirectTrackPage(q, cacheKey, resolve);
+      }
+    })
+    .catch((e) => {
+      log('DEBUG cover: .jsx API error:', e.message);
+      tryDirectTrackPage(q, cacheKey, resolve);
+    });
+}
+
+/** Прямой запрос страницы поиска для извлечения обложек из HTML */
+function tryDirectTrackPage(q, cacheKey, resolve) {
+  const searchUrl = `https://music.yandex.ru/search?text=${encodeURIComponent(q)}`;
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) YandexMusicRPC/2.0',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ru-RU,ru;q=0.9',
+  };
+
+  httpsGetWithRedirects(searchUrl, headers, 3)
+    .then(({ statusCode, data }) => {
+      log('DEBUG cover: direct search page status', statusCode, 'bodyLen:', data.length);
+      if (statusCode === 200 && data.length > 200) {
+        finishParse(data, resolve, cacheKey);
+      } else {
+        log('DEBUG cover: all strategies exhausted for', cacheKey, '(status:', statusCode, 'bodyLen:', data.length, ')');
+        coverCacheSetSafe(cacheKey, null, Date.now());
+        resolve(null);
+      }
+    })
+    .catch((e) => {
+      log('DEBUG cover: all strategies exhausted for', cacheKey, '(error:', e.message, ')');
+      coverCacheSetSafe(cacheKey, null, Date.now());
+      resolve(null);
+    });
 }
 
 function pickLargeImage(track) {
@@ -1779,6 +2047,17 @@ async function main() {
   } catch (_) {}
 
   log('Discord Application ID:', CLIENT_ID, `(${clientIdSource() === 'env' ? 'переменная DISCORD_RPC_CLIENT_ID' : 'встроенный в проект'})`);
+
+  if (clientIdSource() === 'builtin') {
+    log('⚠ Внимание: встроенное приложение Discord НЕ верифицировано.');
+    log('  Статус будет виден только вам. Другие пользователи его не увидят.');
+    log('  Чтобы друзья тоже видели статус (без верификации):');
+    log('  1. Создайте своё приложение на https://discord.com/developers/applications');
+    log('  2. В разделе Rich Presence → Art Assets загрузите иконку (любую картинку)');
+    log('  3. В App Settings → App Testers добавьте Discord-юзернеймы друзей');
+    log('  4. Запускайте с переменной: DISCORD_RPC_CLIENT_ID=ваш_app_id');
+    log('  Верификация приложения не нужна — достаточно добавить друзей в тестеры.');
+  }
 
   if (process.env.RPC_EMBEDDED_IN_ELECTRON !== '1') {
     if (await isPortListening(HTTP_PORT)) {

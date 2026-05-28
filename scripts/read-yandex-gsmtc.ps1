@@ -9,11 +9,17 @@ try {
 function Test-IsYandexMusicGsmtcId([string]$id) {
   if ([string]::IsNullOrWhiteSpace($id)) { return $false }
   if ($id -match '(?i)YandexBrowser') { return $false }
+  # Latin patterns (older versions, English installs)
   if ($id -match '(?i)A025C540\.Yandex\.Music') { return $true }
   if ($id -match '(?i)Yandex\.Music') { return $true }
   if ($id -match '(?i)YandexMusic') { return $true }
   if ($id -match '(?i)Y\.Music\.exe|\\Y\.Music\.exe') { return $true }
   if ($id -match '(?i)yandex.*music|music.*yandex') { return $true }
+  # Cyrillic patterns (newer versions use Cyrillic executable name: Яндекс Музыка.exe)
+  if ($id -match '\u042F\u043D\u0434\u0435\u043A\u0441') { return $true }  # Яндекс
+  if ($id -match '\u041C\u0443\u0437\u044B\u043A\u0430') { return $true }   # Музыка
+  # Also try literal Cyrillic (works when script is saved as UTF-8)
+  if ($id -match 'Яндекс\s*Музыка' -or $id -match 'яндекс\s*музыка') { return $true }
   return $false
 }
 

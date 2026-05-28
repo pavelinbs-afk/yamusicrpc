@@ -569,6 +569,13 @@ function httpsGetWithRedirects(url, headers, maxRedirects) {
     const reqHeaders = { ...headers };
     if (cookieHeader) reqHeaders['Cookie'] = cookieHeader;
 
+    let settled = false;
+    const settleReject = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
     function doRequest(currentUrl, redirectsLeft) {
       const req = https.get(currentUrl, { headers: reqHeaders }, (res) => {
         // Сохраняем куки из ответа
@@ -608,10 +615,14 @@ function httpsGetWithRedirects(url, headers, maxRedirects) {
         // Не редирект — собираем тело
         let data = '';
         res.on('data', (c) => { data += c; });
-        res.on('end', () => resolve({ statusCode: res.statusCode, data, finalUrl: currentUrl }));
+        res.on('end', () => {
+          if (settled) return;
+          settled = true;
+          resolve({ statusCode: res.statusCode, data, finalUrl: currentUrl });
+        });
       });
-      req.on('error', (e) => reject(e));
-      req.setTimeout(8000, () => { req.destroy(); reject(new Error('timeout')); });
+      req.on('error', (e) => settleReject(e));
+      req.setTimeout(8000, () => { req.destroy(); settleReject(new Error('timeout')); });
     }
 
     doRequest(url, max);
@@ -871,6 +882,12 @@ function fetchCoverFromDeezerApi(title, artist, cacheKey) {
   const url = `https://api.deezer.com/search?q=${q}&limit=1`;
 
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      resolve(val);
+    };
     const req = https.get(url, {
       headers: { 'User-Agent': 'YandexMusicRPC/2.0' },
     }, (res) => {
@@ -879,7 +896,8 @@ function fetchCoverFromDeezerApi(title, artist, cacheKey) {
       res.on('end', () => {
         if (res.statusCode !== 200) {
           log('DEBUG deezer API status:', res.statusCode);
-          resolve(null);
+          coverCacheSetSafe(cacheKey, null, Date.now());
+          finish(null);
           return;
         }
         try {
@@ -889,29 +907,29 @@ function fetchCoverFromDeezerApi(title, artist, cacheKey) {
           if (coverUrl && /^https?:\/\//i.test(coverUrl)) {
             log('DEBUG cover from Deezer:', { cacheKey, coverUrl });
             coverCacheSetSafe(cacheKey, coverUrl, Date.now());
-            resolve(coverUrl);
+            finish(coverUrl);
           } else {
             log('DEBUG deezer: no cover in response for', cacheKey);
             coverCacheSetSafe(cacheKey, null, Date.now());
-            resolve(null);
+            finish(null);
           }
         } catch (_) {
           log('DEBUG deezer parse error for', cacheKey);
           coverCacheSetSafe(cacheKey, null, Date.now());
-          resolve(null);
+          finish(null);
         }
       });
     });
     req.on('error', (e) => {
       log('DEBUG deezer API error:', e.message);
       coverCacheSetSafe(cacheKey, null, Date.now());
-      resolve(null);
+      finish(null);
     });
     req.setTimeout(5000, () => {
       req.destroy();
       log('DEBUG deezer API timeout for', cacheKey);
       coverCacheSetSafe(cacheKey, null, Date.now());
-      resolve(null);
+      finish(null);
     });
   });
 }
@@ -1395,9 +1413,17 @@ function getGsmtcScriptPath() {
   return resolveScriptPath('read-yandex-gsmtc.ps1');
 }
 
-function runPowerShellFile(scriptPath) {
+function runPowerShellFile(scriptPath, timeoutMs = 15000) {
   return new Promise((resolve) => {
     if (!fs.existsSync(scriptPath)) return resolve(null);
+    let settled = false;
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { if (ps.exitCode === null) ps.kill(); } catch (_) {}
+      resolve(val);
+    };
     const ps = spawn(
       'powershell.exe',
       ['-NoProfile', '-STA', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
@@ -1409,13 +1435,20 @@ function runPowerShellFile(scriptPath) {
     ps.on('close', () => {
       try {
         const line = out.trim().split(/\r?\n/).filter(Boolean).pop();
-        if (!line) return resolve(null);
-        resolve(JSON.parse(line));
+        if (!line) return finish(null);
+        finish(JSON.parse(line));
       } catch (_) {
-        resolve(null);
+        finish(null);
       }
     });
-    ps.on('error', () => resolve(null));
+    ps.on('error', () => finish(null));
+    const timer = setTimeout(() => {
+      if (!settled) {
+        logErr('PowerShell script timed out after', timeoutMs, 'ms:', scriptPath);
+      }
+      finish(null);
+    }, timeoutMs);
+    if (timer.unref) timer.unref();
   });
 }
 
@@ -1481,11 +1514,24 @@ function postLocalTrackJson(payload) {
 
 function startDesktopPoller() {
   let busy = false;
+  /** Момент когда busy стал true – для детекта зависания */
+  let busySinceMs = 0;
+  const POLLER_HANG_TIMEOUT_MS = 30000;
+
   const tick = async () => {
-    if (busy) return;
+    if (busy) {
+      // Страховка: если поллер висит дольше лимита — принудительно сбрасываем
+      if (busySinceMs && Date.now() - busySinceMs >= POLLER_HANG_TIMEOUT_MS) {
+        logErr('DESKTOP POLLER: busy >', POLLER_HANG_TIMEOUT_MS, 'ms — force reset (PowerShell hang?).');
+        busy = false;
+        busySinceMs = 0;
+      }
+      return;
+    }
     if (!runtimeConfig.desktopPollingEnabled || process.platform !== 'win32') return;
     if (runtimeConfig.preferredSource === 'browser') return;
     busy = true;
+    busySinceMs = Date.now();
     try {
       const data = await desktopPollOnce();
       const browserFresh = Date.now() - lastBrowserPostAt < runtimeConfig.desktopBrowserPriorityMs;
@@ -1528,6 +1574,7 @@ function startDesktopPoller() {
       await postLocalTrackJson(payload);
     } finally {
       busy = false;
+      busySinceMs = 0;
     }
   };
   const pollMs = Math.max(250, Number(runtimeConfig.desktopPollIntervalMs) || 500);

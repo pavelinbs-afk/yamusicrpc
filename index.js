@@ -811,8 +811,8 @@ function finishParse(raw, resolve, cacheKey) {
 }
 
 /**
- * Ищет обложку трека: сначала Яндекс (поисковая страница + API),
- * при неудаче — Deezer API (публичный, без авторизации).
+ * Ищет обложку трека: Яндекс.Музыка и Deezer — одновременно (параллельно).
+ * Яндекс — приоритетный источник; если он медленный / капча / ошибка — Deezer.
  * Возвращает HTTPS-URL или null.
  */
 function fetchCoverFromYandexApi(title, artist) {
@@ -843,30 +843,47 @@ function fetchCoverFromYandexApi(title, artist) {
     const yandexPromise = fetchCoverWithRetries(q, cacheKey, Date.now() + 20000);
     const deezerPromise = fetchCoverFromDeezerApi(title, artist, cacheKey);
 
-    // Ждём первый успешный результат
-    const result = await Promise.race([
-      yandexPromise.then((url) => url ? { url, source: 'yandex' } : null),
-      deezerPromise.then((url) => url ? { url, source: 'deezer' } : null),
+    // Приоритет: Яндекс → Deezer.
+    // Даём Яндексу фору (8 сек — хватит на 1-2 ретрая при капче).
+    const YANDEX_PRIORITY_TIMEOUT_MS = 8000;
+
+    const yandexWithTimeout = Promise.race([
+      yandexPromise,
+      new Promise((r) => {
+        const t = setTimeout(() => r('__timeout__'), YANDEX_PRIORITY_TIMEOUT_MS);
+        if (t.unref) t.unref();
+      }),
     ]);
 
-    if (result) {
-      // Если победил Deezer, но Яндекс ещё не завершился — даём Яндексу шанс
-      // перезаписать кеш (Яндекс-обложки аутентичнее)
-      if (result.source === 'deezer') {
-        yandexPromise.then((yandexUrl) => {
-          if (yandexUrl) {
-            log('DEBUG cover: Deezer was first, but Yandex found cover too — updating cache for', cacheKey);
-            coverCacheSetSafe(cacheKey, yandexUrl, Date.now());
+    const yandexResult = await yandexWithTimeout;
+
+    if (yandexResult === '__timeout__') {
+      // Яндекс не ответил за отведённое время (капча/медленный) — берём Deezer
+      const deezerResult = await deezerPromise;
+      if (deezerResult) {
+        log('DEBUG cover: Yandex too slow, using Deezer for', cacheKey);
+        // Яндекс продолжает искаться в фоне — если найдёт, обновим кеш для следующих запросов
+        yandexPromise.then((url) => {
+          if (url) {
+            log('DEBUG cover: Yandex found later, updating cache for', cacheKey);
+            coverCacheSetSafe(cacheKey, url, Date.now());
           }
         }).catch(() => {});
+        return deezerResult;
       }
-      return result.url;
+      // Deezer тоже не дал результат — ждём Яндекс до конца
+      log('DEBUG cover: both slow, waiting for Yandex to finish for', cacheKey);
+      const yandexLate = await yandexPromise;
+      return yandexLate; // url или null
     }
 
-    // Оба не вернули результат сразу — ждём оставшийся
-    const yandexResult = await yandexPromise;
-    if (yandexResult) return yandexResult;
+    if (yandexResult) {
+      // Яндекс нашёл обложку — лучший результат
+      return yandexResult;
+    }
 
+    // Яндекс вернул null (не нашёл) — пробуем Deezer
+    log('DEBUG cover: Yandex returned null, trying Deezer for', cacheKey);
     const deezerResult = await deezerPromise;
     return deezerResult;
   })().finally(() => {

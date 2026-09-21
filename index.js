@@ -5,7 +5,7 @@
  * Программа для отображения в Discord статуса «Слушает … в Яндекс.Музыке».
  * Источник трека по умолчанию — десктопный клиент Windows (заголовок окна, см. scripts/read-yandex-desktop-title.ps1).
  * HTTP POST /track оставлен для совместимости; в сборке Electron веб-версия не используется.
- * Discord Application ID встроен (lib/discord-client-id.js), переопределение: DISCORD_RPC_CLIENT_ID.
+ * Discord Application ID: встроенный, config.discordClientId или DISCORD_RPC_CLIENT_ID.
  */
 
 const http = require('http');
@@ -17,7 +17,12 @@ const { spawn } = require('child_process');
 const { Client } = require('discord-rpc');
 const { loadConfig, saveConfig, getConfigDir } = require('./lib/config');
 const { createLogger } = require('./lib/logging');
-const { resolveDiscordClientId, clientIdSource } = require('./lib/discord-client-id');
+const {
+  BUILTIN_DISCORD_CLIENT_ID,
+  normalizeClientId,
+  resolveDiscordClientId,
+  clientIdSource,
+} = require('./lib/discord-client-id');
 
 /** Заголовок окна нашего Electron-приложения не должен уходить в Discord как название трека. */
 function isRpcAppWindowTitle(t) {
@@ -159,7 +164,16 @@ function isProcessAlive(pid) {
   }
 }
 
-const CLIENT_ID = resolveDiscordClientId();
+function getActiveClientId() {
+  return resolveDiscordClientId(runtimeConfig);
+}
+
+function describeClientIdSource() {
+  const src = clientIdSource(runtimeConfig);
+  if (src === 'env') return 'переменная DISCORD_RPC_CLIENT_ID';
+  if (src === 'config') return 'настройка в приложении';
+  return 'встроенный в проект';
+}
 
 function isPortListening(port, host = '127.0.0.1', timeoutMs = 250) {
   return new Promise((resolve) => {
@@ -1341,7 +1355,8 @@ function initDiscordRpc(timeoutMs = 20000) {
       startDiscordReconnectLoop();
     });
 
-    client.login({ clientId: CLIENT_ID })
+    const clientId = getActiveClientId();
+    client.login({ clientId })
       .then(() => {
         finishResolve('Discord RPC login() resolved.');
       })
@@ -1351,10 +1366,23 @@ function initDiscordRpc(timeoutMs = 20000) {
         clearTimeout(timer);
         try { client.destroy(); } catch (_) {}
         rpc = null;
-        log('Не удалось подключиться к Discord. Убедись, что Discord запущен и CLIENT_ID верный.');
+        log('Не удалось подключиться к Discord. Убедись, что Discord запущен и Application ID верный.');
         reject(err);
       });
   });
+}
+
+/** Переподключение к Discord с новым Application ID (после смены в настройках). */
+async function reconnectDiscordWithNewClientId() {
+  log('Application ID изменён → переподключаю Discord RPC…');
+  try {
+    if (rpc) {
+      try { await clearActivity({ silent: true }); } catch (_) {}
+      try { rpc.destroy(); } catch (_) {}
+      rpc = null;
+    }
+  } catch (_) {}
+  startDiscordReconnectLoop();
 }
 
 async function connectDiscordWithRetry() {
@@ -1404,6 +1432,18 @@ function mergeConfigPatch(patch) {
   delete p.discordTrackButtonLabel;
   delete p.discordModButtonLabel;
   delete p.discordModButtonUrl;
+  if (Object.prototype.hasOwnProperty.call(p, 'discordClientId')) {
+    const raw = p.discordClientId == null ? '' : String(p.discordClientId).trim();
+    if (!raw) {
+      p.discordClientId = '';
+    } else {
+      const n = normalizeClientId(raw);
+      if (!n) {
+        throw new Error('Неверный Discord Application ID: ожидаются 16–20 цифр.');
+      }
+      p.discordClientId = n;
+    }
+  }
   const out = { ...base, ...p };
   if (p.logging && typeof p.logging === 'object') {
     out.logging = { ...base.logging, ...p.logging };
@@ -1635,7 +1675,9 @@ function runHttpServer() {
         discordConnected: !!rpc,
         port: HTTP_PORT,
         preferredSource: runtimeConfig.preferredSource,
-        discordClientIdSource: clientIdSource(),
+        discordClientId: getActiveClientId(),
+        discordClientIdSource: clientIdSource(runtimeConfig),
+        discordClientIdBuiltin: BUILTIN_DISCORD_CLIENT_ID,
         config: publicConfigSnapshot(),
         configDir: getConfigDir(),
         nowPlaying: lastNowPlaying,
@@ -1658,15 +1700,24 @@ function runHttpServer() {
       req.on('end', async () => {
         try {
           const patch = JSON.parse(body || '{}');
+          const prevClientId = getActiveClientId();
           const merged = mergeConfigPatch(patch);
           saveConfig(merged);
           reloadRuntimeConfig();
           initLogFilesIfNeeded();
-          if (!runtimeConfig.rpcEnabled) {
+          const nextClientId = getActiveClientId();
+          if (prevClientId !== nextClientId) {
+            await reconnectDiscordWithNewClientId();
+          } else if (!runtimeConfig.rpcEnabled) {
             await clearActivity();
           }
           res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, config: publicConfigSnapshot() }));
+          res.end(JSON.stringify({
+            ok: true,
+            config: publicConfigSnapshot(),
+            discordClientId: nextClientId,
+            discordClientIdSource: clientIdSource(runtimeConfig),
+          }));
         } catch (e) {
           res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) }));
@@ -2222,16 +2273,16 @@ async function main() {
     if (vr) log('discord-rpc version:', vr);
   } catch (_) {}
 
-  log('Discord Application ID:', CLIENT_ID, `(${clientIdSource() === 'env' ? 'переменная DISCORD_RPC_CLIENT_ID' : 'встроенный в проект'})`);
+  log('Discord Application ID:', getActiveClientId(), `(${describeClientIdSource()})`);
 
-  if (clientIdSource() === 'builtin') {
+  if (clientIdSource(runtimeConfig) === 'builtin') {
     log('⚠ Внимание: встроенное приложение Discord НЕ верифицировано.');
     log('  Статус будет виден только вам. Другие пользователи его не увидят.');
     log('  Чтобы друзья тоже видели статус (без верификации):');
     log('  1. Создайте своё приложение на https://discord.com/developers/applications');
     log('  2. В разделе Rich Presence → Art Assets загрузите иконку (любую картинку)');
     log('  3. В App Settings → App Testers добавьте Discord-юзернеймы друзей');
-    log('  4. Запускайте с переменной: DISCORD_RPC_CLIENT_ID=ваш_app_id');
+    log('  4. Укажите Application ID в настройках приложения (раздел Discord) или через DISCORD_RPC_CLIENT_ID');
     log('  Верификация приложения не нужна — достаточно добавить друзей в тестеры.');
   }
 

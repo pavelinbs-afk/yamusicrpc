@@ -2,6 +2,7 @@
 'use strict';
 
 const { Client } = require('discord-rpc');
+const { loadConfig } = require('../lib/config');
 const { resolveDiscordClientId } = require('../lib/discord-client-id');
 
 async function main() {
@@ -12,7 +13,9 @@ async function main() {
   }, 5000);
 
   try {
-    await rpc.login({ clientId: resolveDiscordClientId() });
+    let cfg = null;
+    try { cfg = loadConfig(); } catch (_) {}
+    await rpc.login({ clientId: resolveDiscordClientId(cfg) });
     await rpc.clearActivity();
   } finally {
     clearTimeout(timeout);

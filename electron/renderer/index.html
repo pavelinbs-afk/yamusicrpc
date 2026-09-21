@@ -236,7 +236,7 @@
     <div class="bar-track" id="bar-track-line">Нет трека</div>
     <button type="button" class="bar-btn" id="btn-toggle-settings">Настройки</button>
     <button type="button" class="bar-btn bar-min" id="btn-min-to-tray" title="Свернуть в трей">_</button>
-    <button type="button" class="bar-btn bar-close" id="btn-close-app" title="Свернуть в трей">×</button>
+    <button type="button" class="bar-btn bar-close" id="btn-close-app" title="Закрыть приложение">×</button>
   </header>
   <div id="settings-shell" class="settings-hidden">
   <div class="layout-inner">
@@ -251,7 +251,7 @@
     <section id="sec-status" class="panel">
       <h2>Статус</h2>
       <p class="hint" style="margin:0 0 10px">
-        Верхняя полоска: <strong>RPC</strong> и текущий трек. Кнопка <strong>«Настройки»</strong> открывает эту панель в том же окне. <strong>—</strong> и <strong>×</strong> сворачивают окно в <strong>трей</strong> — открыть снова: «Показать окно» в меню по правому клику по иконке или двойной щелчок по ней. Трек берётся из <strong>десктопного клиента</strong> Яндекс.Музыки (Windows). Запустите клиент и включите воспроизведение.
+        Верхняя полоска: <strong>RPC</strong> и текущий трек. Кнопка <strong>«Настройки»</strong> открывает эту панель в том же окне. <strong>—</strong> сворачивает окно в <strong>трей</strong> (открыть снова: «Показать окно» в меню иконки или двойной щелчок). <strong>×</strong> полностью закрывает приложение. Трек берётся из <strong>десктопного клиента</strong> Яндекс.Музыки (Windows). Запустите клиент и включите воспроизведение.
       </p>
       <div class="status" id="status-text">Загрузка…</div>
       <div class="actions">
@@ -277,6 +277,21 @@
       <p class="hint">
       Убирает ссылку на мод.
       </p>
+
+      <label class="row" style="margin-top:16px"><span>Discord Application ID</span></label>
+      <input type="text" id="discord-client-id" inputmode="numeric" autocomplete="off"
+        placeholder="Оставьте пустым для встроенного ID" spellcheck="false" />
+      <p class="hint" id="discord-client-id-hint">
+        Свой Application ID из
+        <a href="https://discord.com/developers/applications" target="_blank" rel="noopener noreferrer">Discord Developer Portal</a>.
+        Пустое поле — встроенное приложение (статус виден только вам, пока приложение не верифицировано).
+        Чтобы друзья видели статус без верификации: создайте своё приложение, добавьте их в App Testers и укажите ID здесь.
+        Переменная окружения DISCORD_RPC_CLIENT_ID имеет приоритет над этим полем.
+      </p>
+      <div class="actions" style="margin-top:8px">
+        <button type="button" class="primary" id="btn-save-discord-id">Сохранить Application ID</button>
+        <button type="button" class="ghost" id="btn-reset-discord-id">Сбросить</button>
+      </div>
     </section>
 
     <section id="sec-look" class="panel hidden">
@@ -416,6 +431,11 @@
         el.innerHTML =
           '<strong>Discord:</strong> ' + (j.discordConnected ? 'подключён' : 'нет соединения') + '<br/>' +
           '<strong>Состояние RPC:</strong> ' + (j.rpcEnabled ? 'Включен' : 'Выключен') + '<br/>' +
+          '<strong>Application ID:</strong> ' + (j.discordClientId || '—') +
+            (j.discordClientIdSource ? ' (' + (
+              j.discordClientIdSource === 'env' ? 'из переменной окружения' :
+              j.discordClientIdSource === 'config' ? 'из настроек' : 'встроенный'
+            ) + ')' : '') + '<br/>' +
           '<strong>Конфиг:</strong> ' + (j.configDir || '—');
         applyNowPlayingToBar(j);
         try {
@@ -434,6 +454,7 @@
     function fillForm(cfg) {
       $('rpc-enabled').checked = cfg.rpcEnabled !== false;
       $('discord-show-mod-btn').checked = cfg.discordShowModButton !== false;
+      $('discord-client-id').value = (cfg.discordClientId || '').trim();
       $('theme').value = cfg.theme || 'dark';
       const fontFamilySelect = $('font-family');
       const savedFamily = (cfg.fontFamily || '').trim();
@@ -458,8 +479,12 @@
         body: JSON.stringify(patch),
       });
       const j = await r.json();
+      if (!j.ok) {
+        throw new Error(j.error || 'Не удалось сохранить настройки');
+      }
       if (j.config) applyTheme(j.config);
       fetchStatus();
+      return j;
     }
 
     async function fetchLogs() {
@@ -492,8 +517,11 @@
     function sendToTray() {
       if (window.ymRpc && window.ymRpc.hideToTray) window.ymRpc.hideToTray();
     }
+    function quitApp() {
+      if (window.ymRpc && window.ymRpc.quitApp) window.ymRpc.quitApp();
+    }
     $('btn-min-to-tray').addEventListener('click', sendToTray);
-    $('btn-close-app').addEventListener('click', sendToTray);
+    $('btn-close-app').addEventListener('click', quitApp);
     function saveDiscordToggles() {
       savePartial({
         rpcEnabled: $('rpc-enabled').checked,
@@ -502,6 +530,23 @@
     }
     $('rpc-enabled').addEventListener('change', saveDiscordToggles);
     $('discord-show-mod-btn').addEventListener('change', saveDiscordToggles);
+    async function saveDiscordClientId() {
+      const raw = ($('discord-client-id').value || '').trim();
+      if (raw && !/^\d{16,20}$/.test(raw)) {
+        alert('Неверный Application ID: нужны 16–20 цифр (из Discord Developer Portal).');
+        return;
+      }
+      try {
+        await savePartial({ discordClientId: raw });
+      } catch (e) {
+        alert(String(e && e.message ? e.message : e));
+      }
+    }
+    $('btn-save-discord-id').addEventListener('click', saveDiscordClientId);
+    $('btn-reset-discord-id').addEventListener('click', () => {
+      $('discord-client-id').value = '';
+      saveDiscordClientId();
+    });
     $('btn-save-look').addEventListener('click', () => {
       savePartial({
         theme: $('theme').value,

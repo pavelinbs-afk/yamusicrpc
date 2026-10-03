@@ -251,11 +251,26 @@
     <section id="sec-status" class="panel">
       <h2>Статус</h2>
       <p class="hint" style="margin:0 0 10px">
-        Верхняя полоска: <strong>RPC</strong> и текущий трек. Кнопка <strong>«Настройки»</strong> открывает эту панель в том же окне. <strong>—</strong> сворачивает окно в <strong>трей</strong> (открыть снова: «Показать окно» в меню иконки или двойной щелчок). <strong>×</strong> полностью закрывает приложение. Трек берётся из <strong>десктопного клиента</strong> Яндекс.Музыки (Windows). Запустите клиент и включите воспроизведение.
+        Верхняя полоска: <strong>RPC</strong> и текущий трек. Кнопка <strong>«Настройки»</strong> открывает эту панель в том же окне. <strong>—</strong> сворачивает окно в <strong>трей</strong> (открыть снова: «Показать окно» в меню иконки или двойной щелчок). <strong>×</strong> полностью закрывает приложение.
+        Для максимальной точности установите <strong>мост в клиент</strong> (ниже) — тогда берутся точные позиция, длительность, обложка и ссылка на трек. Без моста используется GSMTC / заголовок окна.
       </p>
       <div class="status" id="status-text">Загрузка…</div>
       <div class="actions">
         <button type="button" class="ghost" id="btn-refresh">Обновить</button>
+      </div>
+
+      <h2 style="margin-top:22px">Мост в Яндекс.Музыку</h2>
+      <p class="hint" id="bridge-status-hint">Проверка…</p>
+      <p class="hint">
+        Перед установкой <strong>полностью закройте</strong> Яндекс.Музыку (и трей).
+        У установщика клиента включена проверка <code>app.asar</code> — установщик моста
+        один раз ослабляет эту проверку в exe (бэкап <code>.bak-ymrpc</code>) и патчит asar.
+        ~15–40 с. Если Музыка не открывается — <strong>«Удалить мост»</strong>.
+      </p>
+      <div class="actions">
+        <button type="button" class="primary" id="btn-bridge-install">Установить мост</button>
+        <button type="button" class="ghost" id="btn-bridge-uninstall">Удалить мост</button>
+        <button type="button" class="ghost" id="btn-bridge-refresh">Проверить</button>
       </div>
     </section>
 
@@ -428,9 +443,18 @@
           el.textContent = 'Не удалось связаться с RPC сервером. Перезапустите приложение.';
           return;
         }
+        const srcLabel = ({
+          client: 'мост в клиенте',
+          desktop: 'GSMTC / заголовок',
+          browser: 'браузер',
+          web: 'веб',
+          none: 'нет',
+        })[j.activeSource] || (j.activeSource || '—');
         el.innerHTML =
           '<strong>Discord:</strong> ' + (j.discordConnected ? 'подключён' : 'нет соединения') + '<br/>' +
           '<strong>Состояние RPC:</strong> ' + (j.rpcEnabled ? 'Включен' : 'Выключен') + '<br/>' +
+          '<strong>Источник трека:</strong> ' + srcLabel +
+            (j.clientBridgeFresh ? ' (мост активен)' : '') + '<br/>' +
           '<strong>Application ID:</strong> ' + (j.discordClientId || '—') +
             (j.discordClientIdSource ? ' (' + (
               j.discordClientIdSource === 'env' ? 'из переменной окружения' :
@@ -565,8 +589,77 @@
     });
     $('btn-fetch-logs').addEventListener('click', fetchLogs);
 
+    async function fetchBridgeStatus() {
+      const el = $('bridge-status-hint');
+      try {
+        const r = await fetch(API + '/api/bridge/status');
+        const j = await r.json();
+        if (!j.ok && j.error) {
+          el.textContent = 'Мост: ' + j.error;
+          return j;
+        }
+        if (j.installed) {
+          el.textContent =
+            'Мост установлен' +
+            (j.asarPath ? ' (' + j.asarPath + ')' : '') +
+            (j.backupPresent ? '. Есть резервная копия.' : '.');
+        } else {
+          el.textContent =
+            'Мост не установлен' +
+            (j.asarPath ? '. Найден клиент: ' + j.asarPath : '. Клиент Яндекс.Музыки не найден.');
+        }
+        return j;
+      } catch (e) {
+        el.textContent = 'Не удалось проверить мост: ' + String(e);
+        return null;
+      }
+    }
+
+    async function runBridgeAction(path, confirmText) {
+      if (confirmText && !confirm(confirmText)) return;
+      const el = $('bridge-status-hint');
+      el.textContent = 'Выполняется… Закройте Яндекс.Музыку, если ещё открыта.';
+      try {
+        const r = await fetch(API + path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        const j = await r.json();
+        if (!j.ok) {
+          alert(j.error || 'Ошибка');
+        } else {
+          alert(
+            path.indexOf('uninstall') >= 0
+              ? 'Мост удалён. Перезапустите Яндекс.Музыку.'
+              : 'Мост установлен. Полностью перезапустите Яндекс.Музыку.',
+          );
+        }
+      } catch (e) {
+        alert(String(e));
+      }
+      fetchBridgeStatus();
+      fetchStatus();
+    }
+
+    $('btn-bridge-install').addEventListener('click', () =>
+      runBridgeAction(
+        '/api/bridge/install',
+        'Установить мост в app.asar Яндекс.Музыки?\n\nПеред этим полностью закройте Яндекс.Музыку.',
+      ),
+    );
+    $('btn-bridge-uninstall').addEventListener('click', () =>
+      runBridgeAction(
+        '/api/bridge/uninstall',
+        'Удалить мост из Яндекс.Музыки?',
+      ),
+    );
+    $('btn-bridge-refresh').addEventListener('click', fetchBridgeStatus);
+
     fetchStatus();
+    fetchBridgeStatus();
     setInterval(fetchStatus, 8000);
+    setInterval(fetchBridgeStatus, 15000);
     setInterval(async () => {
       try {
         const r = await fetch(API + '/api/status');

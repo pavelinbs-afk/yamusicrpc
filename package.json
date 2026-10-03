@@ -1,26 +1,38 @@
 {
   "name": "yandex-music-discord-rpc",
-  "version": "2.1.3",
+  "version": "2.2.2",
   "description": "Официальное приложение RPC для статуса в Discord",
   "author": "Yandex Music RPC",
   "main": "electron/main.js",
   "packageManager": "pnpm@9.15.9",
   "scripts": {
     "app": "electron .",
-    "postinstall": "node scripts/patch-discord-rpc.js && node scripts/ensure-icon.js",
+    "postinstall": "node scripts/patch-discord-rpc.js && node scripts/ensure-icon.js && node scripts/ensure-asar.js",
     "icon": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-build-icon.ps1",
     "dist": "pnpm run icon && electron-builder --win --x64",
     "dist:nomsi": "pnpm run icon && electron-builder --win nsis portable --x64",
     "pack": "pnpm run icon && electron-builder --win --x64 --dir",
-    "dev:rpc": "node index.js"
+    "dev:rpc": "node index.js",
+    "bridge:install": "node scripts/install-client-bridge.js",
+    "bridge:uninstall": "node scripts/install-client-bridge.js --uninstall",
+    "bridge:status": "node scripts/install-client-bridge.js --status"
   },
   "dependencies": {
+    "@electron/asar": "^3.4.1",
+    "@electron/fuses": "1.8.0",
     "discord-rpc": "^3.2.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "electron": "^28.3.3",
     "electron-builder": "^24.13.3"
+  },
+  "pnpm": {
+    "peerDependencyRules": {
+      "ignoreMissing": [
+        "register-scheme"
+      ]
+    }
   },
   "build": {
     "appId": "com.yandexmusic.discordrpc",
@@ -29,8 +41,28 @@
     "directories": {
       "output": "release"
     },
+    "files": [
+      "**/*",
+      "!release${/*}",
+      "!logs${/*}",
+      "!.versions${/*}"
+    ],
+    "extraResources": [
+      {
+        "from": "client-bridge",
+        "to": "client-bridge"
+      },
+      {
+        "from": "scripts/install-client-bridge.js",
+        "to": "scripts/install-client-bridge.js"
+      }
+    ],
     "asarUnpack": [
       "scripts/**/*.ps1",
+      "scripts/install-client-bridge.js",
+      "client-bridge/**/*",
+      "node_modules/@electron/asar/**/*",
+      "node_modules/@electron/fuses/**/*",
       "electron/icon.ico"
     ],
     "win": {

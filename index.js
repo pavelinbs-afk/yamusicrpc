@@ -77,6 +77,11 @@ function isYandexAppMarketingTitle(title, artist, album) {
   ) {
     return true;
   }
+  // Плейлисты / подборки («Лучшее: Artist») вместо названия трека.
+  if (/^лучшее\s*:/i.test(t) || /^best of\b/i.test(t)) return true;
+  if (/^(плейлист|playlist|альбом|album|сборник)\b/i.test(t)) return true;
+  // Одинаковые title=artist=playlist — типичный глюк при открытой странице плейлиста.
+  if (t && a && t === a && (/^лучшее\s*:/i.test(t) || /playlist|плейлист/i.test(t))) return true;
   // «Коллекция» без артиста — почти всегда хром UI, не трек.
   if (!a && /^(коллекция|моя\s*волна|главная|главное|поиск)$/i.test(t)) return true;
   return false;
@@ -104,8 +109,8 @@ const DISCORD_PLAYING_HEARTBEAT_MS = 120000;
  * периодически подтягиваем start/end от живой позиции — учитывает перемотку и дрейф.
  */
 const CLIENT_ACTIVITY_RESYNC_MS = 10000;
-/** Для client/browser перемотку ловим раньше, чем для шумного GSMTC. */
-const CLIENT_SEEK_JUMP_SEC = 1.5;
+/** Для client/browser: скачок сверх ожидаемого хода (см. детект ниже). */
+const CLIENT_SEEK_JUMP_SEC = 2.25;
 // В paused-состоянии не нужно спамить одинаковым payload на каждом тике поллера.
 const DISCORD_PAUSED_UPDATE_INTERVAL_MS = 15000;
 /** Если Discord не отвечает на SET_ACTIVITY, иначе Promise висит навсегда и вся очередь RPC замирает. */
@@ -1235,6 +1240,10 @@ function toDiscordRpcUnixMs(ms) {
 }
 
 function resolveDiscordListeningTimestamps(track, elapsedSec, totalSec, nowMs, offsetMs) {
+  // Client/seek: как BetaMod — всегда start/end от живой позиции.
+  if (track && track.forceTimelineFromPosition) {
+    return computeDiscordListeningTimestamps(elapsedSec, totalSec, nowMs, offsetMs);
+  }
   const s = track && track.discordStartMs;
   const e = track && track.discordEndMs;
   if (
@@ -1254,11 +1263,8 @@ function resolveDiscordListeningTimestamps(track, elapsedSec, totalSec, nowMs, o
       const elapsedFromAnchorSec = (nowMs - s) / 1000;
       /*
        * Держим стабильный start/end: Discord сам двигает полоску.
-       * Пересчёт от now−position только при явном seek (>8с), иначе каждые ~15с
-       * полоска визуально «сбрасывается».
+       * Пересчёт от now−position только при явном seek, иначе полоска «сбрасывается».
        */
-      // После перемотки якорь уже новый (start ≈ now−pos) — всегда принимаем его,
-      // если end ещё в будущем. Иначе полоска «сбрасывается» на старый прогресс.
       if (Math.abs(elapsedFromAnchorSec - elapsedSec) <= SEEK_JUMP_SEC + 0.75) {
         return { startAdjusted, endAdjusted };
       }
@@ -2181,17 +2187,22 @@ function runHttpServer() {
               }
               const jumpFromAnchor = Math.abs(expectedFromAnchor - posSec);
               const jumpFromLast = Math.abs(expectedFromLast - posSec);
+              const dtObservedSec =
+                lastObservedWallMs != null ? Math.max(0.2, (now - lastObservedWallMs) / 1000) : 0;
+              // Client: порог = ожидаемый ход времени + запас; иначе обычные тики дают ложный seek.
+              const clientSeekThresh = dtObservedSec + seekJumpSec;
+              const seekHit = isClientLike
+                ? jumpFromLast > clientSeekThresh || jumpFromAnchor > clientSeekThresh + 1
+                : jumpFromLast > seekJumpSec || jumpFromAnchor > seekJumpSec + 2;
               // Для GSMTC сырая позиция часто врёт — там свой seek; для client/browser — ловим скраб.
-              if (
-                !gsmtcTimeline &&
-                (jumpFromLast > seekJumpSec || jumpFromAnchor > seekJumpSec + (isClientLike ? 1 : 2))
-              ) {
+              if (!gsmtcTimeline && seekHit) {
                 currentTrackStart = now - posSec * 1000;
                 timelineSeeked = true;
                 log('DEBUG seek detected:', {
                   pos: posSec.toFixed(1),
                   fromAnchor: expectedFromAnchor.toFixed(1),
                   fromLast: expectedFromLast.toFixed(1),
+                  thresh: (isClientLike ? clientSeekThresh : seekJumpSec).toFixed(1),
                   src,
                 });
               }
@@ -2359,9 +2370,14 @@ function runHttpServer() {
           }
 
           // время для логов и для текстового отображения в Discord:
-          // elapsed/total считаем из позиции/длительности трека, без привязки к таймстемпам
-          const pForDisplay = posSec != null ? posSec : 0;
-          const dForDisplay = durSec != null ? durSec : 0;
+          // без сырой позиции НЕ подставляем 0 (это сбрасывало тайм-бар и ломало seek).
+          let pForDisplay = posSec;
+          if (pForDisplay == null && currentTrackStart != null && Number.isFinite(currentTrackStart)) {
+            pForDisplay = Math.max(0, (now - currentTrackStart) / 1000);
+          }
+          if (pForDisplay == null) pForDisplay = 0;
+          const dForDisplay =
+            effectiveDurSec != null ? effectiveDurSec : durSec != null ? durSec : 0;
           let elapsedForDisplaySec = dForDisplay > 0 ? Math.min(pForDisplay, dForDisplay) : pForDisplay;
           const totalForDisplaySec = dForDisplay > 0 ? dForDisplay : Math.max(pForDisplay, dForDisplay);
           const cycleRestartDetected =
@@ -2540,9 +2556,17 @@ function runHttpServer() {
               });
             }
             if (canUpdate) {
-              if (key !== lastSentTrackKey || lastSentTrackKey === '__cleared_pause__' || timelineSeeked) {
+              if (key !== lastSentTrackKey || lastSentTrackKey === '__cleared_pause__' || timelineSeeked || clientTimelineResync) {
                 log('DEBUG timing for activity:',
-                  { positionSec: elapsedForDisplaySec, durationSecPassed: effectiveDurSec != null ? effectiveDurSec : totalForDisplaySec, rawDurationSec: durSec, seek: timelineSeeked },
+                  {
+                    positionSec: elapsedForDisplaySec,
+                    durationSecPassed: effectiveDurSec != null ? effectiveDurSec : totalForDisplaySec,
+                    rawDurationSec: durSec,
+                    rawPosSec: posSec,
+                    seek: timelineSeeked,
+                    resync: clientTimelineResync,
+                    src,
+                  },
                   'endsAtMs=', endsAtMs != null ? Math.round(endsAtMs / 1000) : null
                 );
               }
@@ -2554,6 +2578,9 @@ function runHttpServer() {
                 positionSec: elapsedForDisplaySec,
                 durationSec: effectiveDurSec != null ? effectiveDurSec : totalForDisplaySec,
                 url: trackUrl,
+                // Client + перемотка: всегда пересчитываем start/end от позиции (BetaMod).
+                forceTimelineFromPosition:
+                  Boolean(isClientLike && posSec != null) || timelineSeeked || clientTimelineResync,
                 discordStartMs:
                   currentTrackStart != null && Number.isFinite(currentTrackStart)
                     ? currentTrackStart

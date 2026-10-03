@@ -44,8 +44,8 @@
     /** Пока играет — шлём позицию не реже этого интервала (сек → Discord seek/таймбар). */
     var POST_PLAYING_MS = 900;
     var POST_IDLE_MS = 2500;
-    /** Скачок позиции (сек) = перемотка → POST сразу, без ожидания cooldown. */
-    var SEEK_FORCE_SEC = 1.25;
+    /** Скачок сверх ожидаемого хода времени = перемотка → POST сразу. */
+    var SEEK_FORCE_SEC = 1.75;
     var lastPostAt = 0;
     var lastPayloadKey = '';
     var lastPostedPosSec = null;
@@ -93,15 +93,20 @@
       ].join('|');
     }
 
+    function isSeekJump(pos, now) {
+      if (!Number.isFinite(pos) || lastPostedPosSec == null || !lastPostAt) return false;
+      var dtSec = Math.max(0.2, (now - lastPostAt) / 1000);
+      var delta = Math.abs(pos - lastPostedPosSec);
+      // Обычный ход трека ≈ dt; перемотка — заметно больше.
+      return delta > dtSec + SEEK_FORCE_SEC;
+    }
+
     function shouldPost(payload, key, now) {
       if (!payload || !key) return false;
       var pos = Number(payload.positionSec);
       var hasPos = Number.isFinite(pos);
       var trackChanged = key !== lastPayloadKey;
-      var seek =
-        hasPos &&
-        lastPostedPosSec != null &&
-        Math.abs(pos - lastPostedPosSec) > SEEK_FORCE_SEC;
+      var seek = hasPos && isSeekJump(pos, now);
       if (trackChanged || seek) return true;
       if (now - lastPostAt < POST_MIN_MS) return false;
       if (!payload.paused && hasPos) {
@@ -110,6 +115,10 @@
         if (Math.abs(pos - lastPostedPosSec) >= 0.35) return true;
         if (now - lastPostAt >= POST_PLAYING_MS) return true;
         return false;
+      }
+      // На паузе тоже ловим перемотку (уже выше) и редкие heartbeat'ы.
+      if (payload.paused && hasPos && lastPostedPosSec != null && Math.abs(pos - lastPostedPosSec) >= 0.5) {
+        return true;
       }
       return now - lastPostAt >= POST_IDLE_MS;
     }
@@ -219,16 +228,14 @@
           var key = payloadKey(payload);
           if (!shouldPost(payload, key, now)) return;
           var posNum = Number(payload.positionSec);
-          var seek =
-            Number.isFinite(posNum) &&
-            lastPostedPosSec != null &&
-            Math.abs(posNum - lastPostedPosSec) > SEEK_FORCE_SEC;
+          var seek = Number.isFinite(posNum) && isSeekJump(posNum, now);
           var ok = await postTrack(payload);
           if (ok) {
             lastPostAt = Date.now();
             lastPayloadKey = key;
             if (Number.isFinite(posNum)) lastPostedPosSec = posNum;
-            if (seek || now - lastDiagAt > 8000) {
+            var missingPos = !Number.isFinite(posNum);
+            if (seek || (missingPos && now - lastDiagAt > 12000) || now - lastDiagAt > 8000) {
               lastDiagAt = now;
               dlog(
                 'posted ok title=' +
@@ -239,8 +246,19 @@
                   (payload.paused ? '1' : '0') +
                   ' pos=' +
                   (Number.isFinite(posNum) ? posNum.toFixed(1) : '?') +
+                  ' dur=' +
+                  (payload.durationSec != null ? Number(payload.durationSec).toFixed(1) : '?') +
                   (seek ? ' SEEK' : '')
               );
+              if (missingPos) {
+                try {
+                  var probe = await wc.executeJavaScript(
+                    '(function(){try{return typeof window.__ymRpcProbe==="function"?window.__ymRpcProbe():null;}catch(e){return {err:String(e&&e.message||e)};}})()',
+                    true
+                  );
+                  if (probe) dlog('probe-nopos ' + JSON.stringify(probe));
+                } catch (_) {}
+              }
             }
           }
           return;

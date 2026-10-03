@@ -34,6 +34,18 @@
     return current || null;
   }
 
+  /** Не поднимаемся к корню страницы — иначе ловим entityMeta плейлиста вместо трека. */
+  function getPlayerScopedFiber(fiber, maxUp) {
+    let current = fiber;
+    let steps = 0;
+    const limit = maxUp == null ? 14 : maxUp;
+    while (current && current.return && steps < limit) {
+      current = current.return;
+      steps += 1;
+    }
+    return current || fiber;
+  }
+
   function traverseFiber(fiber, isFoundCallback, depth) {
     if (!fiber || depth > 100) return null;
     const result = isFoundCallback(fiber, depth);
@@ -46,8 +58,8 @@
   function searchProperty(element, property) {
     const fiberNode = findFiberNode(element);
     if (!fiberNode) return null;
-    const rootFiber = getRootFiber(fiberNode);
-    return traverseFiber(rootFiber, (fiber) => {
+    const scoped = getPlayerScopedFiber(fiberNode, 14);
+    return traverseFiber(scoped, (fiber) => {
       if (fiber.memoizedProps && Object.prototype.hasOwnProperty.call(fiber.memoizedProps, property)) {
         return fiber.memoizedProps;
       }
@@ -96,12 +108,25 @@
   }
 
   function parseTimecode(text) {
-    const m = String(text || '').match(/(\d+):(\d{2})\s*[\/|]\s*(\d+):(\d{2})/);
-    if (!m) return null;
-    const position = Number(m[1]) * 60 + Number(m[2]);
-    const duration = Number(m[3]) * 60 + Number(m[4]);
-    if (!Number.isFinite(position) || !Number.isFinite(duration) || duration <= 0.5) return null;
-    return { position, duration };
+    const s = String(text || '');
+    let m = s.match(/(\d+):(\d{2})\s*[\/|]\s*(\d+):(\d{2})/);
+    if (m) {
+      const position = Number(m[1]) * 60 + Number(m[2]);
+      const duration = Number(m[3]) * 60 + Number(m[4]);
+      if (Number.isFinite(position) && Number.isFinite(duration) && duration > 0.5) {
+        return { position, duration };
+      }
+    }
+    // Иногда "1:23 из 3:45" / "1:23 of 3:45"
+    m = s.match(/(\d+):(\d{2})\s*(?:из|of|\/)\s*(\d+):(\d{2})/i);
+    if (m) {
+      const position = Number(m[1]) * 60 + Number(m[2]);
+      const duration = Number(m[3]) * 60 + Number(m[4]);
+      if (Number.isFinite(position) && Number.isFinite(duration) && duration > 0.5) {
+        return { position, duration };
+      }
+    }
+    return null;
   }
 
   function normalizeProgress(duration, position) {
@@ -109,12 +134,91 @@
     // Иногда приходят миллисекунды.
     if (duration > 10000) {
       duration = duration / 1000;
-      position = position / 1000;
+      if (position > 500) position = position / 1000;
     }
+    if (position < 0) return null;
     return {
       duration,
       position: Math.max(0, Math.min(position, duration)),
     };
+  }
+
+  function progressFromObject(obj, fallbackDurationSec) {
+    if (!obj || typeof obj !== 'object') return null;
+    let duration = NaN;
+    if (obj.duration != null) duration = Number(obj.duration);
+    else if (obj.durationSec != null) duration = Number(obj.durationSec);
+    else if (obj.durationMs != null) duration = Number(obj.durationMs) / 1000;
+    else if (fallbackDurationSec != null) duration = Number(fallbackDurationSec);
+
+    let position = NaN;
+    if (obj.position != null) position = Number(obj.position);
+    else if (obj.currentTime != null) position = Number(obj.currentTime);
+    else if (obj.positionSec != null) position = Number(obj.positionSec);
+    else if (obj.positionMs != null) position = Number(obj.positionMs) / 1000;
+    else if (obj.progress != null && Number.isFinite(duration)) {
+      const pr = Number(obj.progress);
+      if (!Number.isFinite(pr)) position = NaN;
+      else if (pr >= 0 && pr <= 1) position = pr * (duration > 10000 ? duration / 1000 : duration);
+      else position = pr;
+    }
+    return normalizeProgress(duration, position);
+  }
+
+  function deepFindProgress(node, depth, seen, fallbackDurationSec) {
+    if (!node || depth > 10 || seen.has(node)) return null;
+    if (typeof node !== 'object') return null;
+    seen.add(node);
+    const direct = progressFromObject(node, fallbackDurationSec);
+    // Не принимаем «пустые» прогрессы без явных полей времени.
+    if (
+      direct &&
+      (node.duration != null ||
+        node.durationSec != null ||
+        node.durationMs != null ||
+        node.position != null ||
+        node.currentTime != null ||
+        node.positionSec != null ||
+        node.timecodeClassName != null ||
+        node.currentTimecodeClassName != null)
+    ) {
+      return direct;
+    }
+    if (Array.isArray(node)) {
+      for (let i = 0; i < Math.min(node.length, 50); i++) {
+        const found = deepFindProgress(node[i], depth + 1, seen, fallbackDurationSec);
+        if (found) return found;
+      }
+      return null;
+    }
+    const keys = Object.keys(node);
+    for (let i = 0; i < Math.min(keys.length, 80); i++) {
+      const k = keys[i];
+      if (k === 'stateNode' || k === 'ref' || k === '_owner' || k === 'children') continue;
+      try {
+        const found = deepFindProgress(node[k], depth + 1, seen, fallbackDurationSec);
+        if (found) return found;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function getProgressFromFiberDeep(player, fallbackDurationSec) {
+    const fiberNode = findFiberNode(player);
+    if (!fiberNode) return null;
+    const scoped = getPlayerScopedFiber(fiberNode, 14);
+    return traverseFiber(
+      scoped,
+      (f) => {
+        const buckets = [f.memoizedProps, f.memoizedState, f.pendingProps];
+        for (let b = 0; b < buckets.length; b++) {
+          const hit = deepFindProgress(buckets[b], 0, new Set(), fallbackDurationSec);
+          if (hit) return hit;
+        }
+        return null;
+      },
+      0
+    );
   }
 
   function getProgressFromMediaElements() {
@@ -142,50 +246,101 @@
     }
   }
 
-  function getProgress(player) {
-    // Как BetaMod: сначала fiber (timecodeClassName), затем DOM/media.
-    const fiber = searchAnyProperty(player, [
-      'timecodeClassName',
-      'currentTimecodeClassName',
-      'position',
-      'progress',
-    ]);
-    if (fiber) {
-      const duration = Number(fiber.duration != null ? fiber.duration : fiber.durationSec);
-      const position = Number(
-        fiber.position != null
-          ? fiber.position
-          : fiber.currentTime != null
-            ? fiber.currentTime
-            : fiber.progress
+  function getProgressFromDomText(player) {
+    const combined = parseTimecode(player.innerText || player.textContent || '');
+    if (combined) return combined;
+    const times = [];
+    const re = /\b(\d{1,2}):([0-5]\d)\b/g;
+    const src = String(player.innerText || '');
+    let m;
+    while ((m = re.exec(src)) && times.length < 10) {
+      times.push(Number(m[1]) * 60 + Number(m[2]));
+    }
+    if (times.length >= 2) {
+      const position = times[0];
+      let duration = times[1];
+      for (let i = 1; i < times.length; i++) {
+        if (times[i] >= position && times[i] > duration) duration = times[i];
+      }
+      // Типичный playerbar: текущее, затем длительность (>= текущего).
+      for (let i = 1; i < times.length; i++) {
+        if (times[i] >= position) {
+          duration = times[i];
+          break;
+        }
+      }
+      return normalizeProgress(duration, position);
+    }
+    return null;
+  }
+
+  function getProgressFromSliders(player, fallbackDurationSec) {
+    const sliders = player.querySelectorAll(
+      '[data-test-id="VIBE_PLAYERBAR_TIMECODE_SLIDER"], [role="slider"][aria-valuenow], input[type="range"]'
+    );
+    for (let i = 0; i < sliders.length; i++) {
+      const slider = sliders[i];
+      const max = Number(
+        slider.getAttribute('aria-valuemax') != null
+          ? slider.getAttribute('aria-valuemax')
+          : slider.max
       );
-      const norm = normalizeProgress(duration, position);
+      const now = Number(
+        slider.getAttribute('aria-valuenow') != null
+          ? slider.getAttribute('aria-valuenow')
+          : slider.value
+      );
+      const fromText = parseTimecode(
+        slider.getAttribute('aria-valuetext') || slider.getAttribute('aria-label') || ''
+      );
+      if (fromText) return fromText;
+      if (Number.isFinite(max) && Number.isFinite(now) && max > 0.5) {
+        // Секунды
+        if (max > 1.5) {
+          const norm = normalizeProgress(max, now);
+          if (norm) return norm;
+        }
+        // Доля 0..1 или проценты 0..100 → нужна длительность трека
+        if (fallbackDurationSec != null && fallbackDurationSec > 0.5) {
+          const frac = max <= 1.0001 ? now / (max || 1) : now / max;
+          const norm = normalizeProgress(fallbackDurationSec, frac * fallbackDurationSec);
+          if (norm) return norm;
+        }
+      }
+    }
+    return null;
+  }
+
+  function getProgress(player, fallbackDurationSec) {
+    // 1) Как BetaMod: timecodeClassName / currentTimecodeClassName
+    const fiber = searchAnyProperty(player, ['timecodeClassName', 'currentTimecodeClassName']);
+    if (fiber) {
+      const norm = progressFromObject(fiber, fallbackDurationSec);
       if (norm) return norm;
     }
 
+    // 2) Глубокий обход fiber — Vibe часто прячет duration/position глубже
+    const deep = getProgressFromFiberDeep(player, fallbackDurationSec);
+    if (deep) return deep;
+
+    // 3) HTMLMediaElement
     const fromMedia = getProgressFromMediaElements();
     if (fromMedia) return fromMedia;
 
-    const slider =
-      player.querySelector('[data-test-id="VIBE_PLAYERBAR_TIMECODE_SLIDER"]') ||
-      player.querySelector('[role="slider"][aria-valuenow]');
-    if (slider) {
-      const max = Number(slider.getAttribute('aria-valuemax'));
-      const now = Number(slider.getAttribute('aria-valuenow'));
-      const fromAria = normalizeProgress(max, now);
-      if (fromAria) return fromAria;
-      const fromText = parseTimecode(slider.getAttribute('aria-valuetext') || '');
-      if (fromText) return fromText;
-    }
+    // 4) Слайдеры / aria
+    const fromSlider = getProgressFromSliders(player, fallbackDurationSec);
+    if (fromSlider) return fromSlider;
 
+    // 5) Текст таймкода в playerbar (в т.ч. раздельные mm:ss)
     const tc =
       player.querySelector('[data-test-id="VIBE_PLAYERBAR_TIMECODE"]') ||
-      player.querySelector('[data-test-id="VIBE_PLAYERBAR_TIMECODE_SLIDER"]');
+      player.querySelector('[data-test-id="VIBE_PLAYERBAR_TIMECODE_SLIDER"]') ||
+      player.querySelector('[data-test-id*="TIMECODE"]');
     if (tc) {
       const fromDom = parseTimecode(tc.textContent || tc.getAttribute('aria-valuetext') || '');
       if (fromDom) return fromDom;
     }
-    return null;
+    return getProgressFromDomText(player);
   }
 
   function isUiChromeTitle(title) {
@@ -197,85 +352,158 @@
     );
   }
 
-  function looksLikeTrackMeta(obj) {
-    if (!obj || typeof obj !== 'object') return false;
-    if (typeof obj.title !== 'string' || !obj.title) return false;
-    if (isUiChromeTitle(obj.title)) return false;
-    // Навигационные сущности часто без артистов/обложки трека.
-    const hasArtists = Array.isArray(obj.artists) && obj.artists.length > 0;
-    const hasCover = Boolean(obj.coverUri || obj.ogImage);
-    return Boolean(hasCover || hasArtists || (obj.id != null && hasArtists));
+  /** Заголовки плейлистов/разделов, которые не должны попадать в Discord. */
+  function isPlaylistOrSectionTitle(title) {
+    const t = String(title || '').trim();
+    if (!t) return true;
+    if (isUiChromeTitle(t)) return true;
+    if (/^лучшее\s*:/i.test(t)) return true;
+    if (/^(плейлист|playlist|альбом|album|сборник|микс|wave|волна)\b/i.test(t)) return true;
+    if (/^best of\b/i.test(t)) return true;
+    return false;
   }
 
-  function deepFindTrackMeta(node, depth, seen) {
-    if (!node || depth > 8 || seen.has(node)) return null;
-    if (typeof node !== 'object') return null;
+  function trackMetaScore(obj) {
+    if (!obj || typeof obj !== 'object') return -1;
+    if (typeof obj.title !== 'string' || !obj.title) return -1;
+    if (isPlaylistOrSectionTitle(obj.title)) return -1;
+    const type = obj.type != null ? String(obj.type).toLowerCase() : '';
+    if (type && /^(playlist|album|artist|user|podcast|various|brand|clip)$/.test(type)) return -1;
+    if (type && type !== 'music' && type !== 'track' && type !== 'audio') {
+      // Неизвестные типы — только если есть явные признаки трека.
+    }
+    const cover = String(obj.coverUri || obj.ogImage || '');
+    if (/get-music-user-playlist|\/users\/[^/]+\/playlists\//i.test(cover)) return -1;
+    const hasArtists = Array.isArray(obj.artists) && obj.artists.length > 0;
+    const durationMs = Number(obj.durationMs);
+    const hasDuration = Number.isFinite(durationMs) && durationMs > 1000;
+    // Как BetaMod zod: трек обычно имеет artists + durationMs (+ id).
+    if (!hasArtists || !hasDuration) return -1;
+    let score = 10;
+    if (type === 'music' || type === 'track' || type === 'audio') score += 5;
+    if (obj.id != null) score += 3;
+    if (obj.albums && obj.albums[0]) score += 2;
+    if (cover && !/playlist/i.test(cover)) score += 1;
+    return score;
+  }
+
+  function looksLikeTrackMeta(obj) {
+    return trackMetaScore(obj) >= 10;
+  }
+
+  function deepFindTrackMeta(node, depth, seen, best) {
+    if (!node || depth > 8 || seen.has(node)) return best;
+    if (typeof node !== 'object') return best;
     seen.add(node);
-    if (looksLikeTrackMeta(node)) return node;
+    const score = trackMetaScore(node);
+    if (score > (best ? best.score : -1)) {
+      best = { meta: node, score };
+    }
     if (Array.isArray(node)) {
       for (let i = 0; i < Math.min(node.length, 40); i++) {
-        const found = deepFindTrackMeta(node[i], depth + 1, seen);
-        if (found) return found;
+        best = deepFindTrackMeta(node[i], depth + 1, seen, best);
       }
-      return null;
+      return best;
     }
     const keys = Object.keys(node);
     for (let i = 0; i < Math.min(keys.length, 60); i++) {
       const k = keys[i];
-      if (k === 'stateNode' || k === 'ref' || k === '_owner') continue;
+      if (k === 'stateNode' || k === 'ref' || k === '_owner' || k === 'children') continue;
       try {
-        const found = deepFindTrackMeta(node[k], depth + 1, seen);
-        if (found) return found;
+        best = deepFindTrackMeta(node[k], depth + 1, seen, best);
       } catch (_) {}
     }
-    return null;
+    return best;
+  }
+
+  function cloneMeta(meta) {
+    try {
+      return JSON.parse(JSON.stringify(meta));
+    } catch (_) {
+      return meta;
+    }
   }
 
   function getTrackMeta(player) {
+    let best = null;
+
     const fiber = searchAnyProperty(player, [
       'entityMeta',
       'track',
       'currentTrack',
-      'meta',
-      'queue',
-      'playerState',
       'fullscreenPlayerEntityMeta',
     ]);
     if (fiber) {
-      let meta = fiber.entityMeta || fiber.track || fiber.currentTrack || fiber.meta || fiber.fullscreenPlayerEntityMeta;
-      if (!meta || typeof meta !== 'object') {
-        if (fiber.title) meta = fiber;
-      }
-      if (looksLikeTrackMeta(meta)) {
-        try {
-          return JSON.parse(JSON.stringify(meta));
-        } catch (_) {
-          return meta;
-        }
+      const candidates = [
+        fiber.entityMeta,
+        fiber.track,
+        fiber.currentTrack,
+        fiber.fullscreenPlayerEntityMeta,
+        fiber.title ? fiber : null,
+      ];
+      for (let i = 0; i < candidates.length; i++) {
+        const meta = candidates[i];
+        const score = trackMetaScore(meta);
+        if (score > (best ? best.score : -1)) best = { meta, score };
       }
     }
 
-    // Глубокий обход fiber-дерева (новый Vibe UI часто прячет meta глубже).
+    // Только в поддереве playerbar (не весь документ — иначе заголовок плейлиста).
     const fiberNode = findFiberNode(player);
     if (fiberNode) {
-      const root = getRootFiber(fiberNode);
-      const found = traverseFiber(root, (f) => {
-        const buckets = [f.memoizedProps, f.memoizedState, f.pendingProps];
-        for (let b = 0; b < buckets.length; b++) {
-          const hit = deepFindTrackMeta(buckets[b], 0, new Set());
-          if (hit) return hit;
-        }
-        return null;
-      }, 0);
-      if (found) {
-        try {
-          return JSON.parse(JSON.stringify(found));
-        } catch (_) {
-          return found;
-        }
+      const scoped = getPlayerScopedFiber(fiberNode, 14);
+      traverseFiber(
+        scoped,
+        (f) => {
+          const buckets = [f.memoizedProps, f.memoizedState, f.pendingProps];
+          for (let b = 0; b < buckets.length; b++) {
+            const hit = deepFindTrackMeta(buckets[b], 0, new Set(), null);
+            if (hit && hit.score > (best ? best.score : -1)) best = hit;
+          }
+          return null;
+        },
+        0
+      );
+    }
+
+    return best && best.meta ? cloneMeta(best.meta) : null;
+  }
+
+  function readPlayerbarDomTrack(player) {
+    const nameEl =
+      player.querySelector('[data-test-id="VIBE_PLAYERBAR_TRACK_NAME"]') ||
+      player.querySelector('[data-test-id="TRACK_TITLE"]') ||
+      player.querySelector('a[href*="/track/"]');
+    let raw = nameEl ? (nameEl.textContent || '').trim() : '';
+    raw = dedupeRepeatedText(raw);
+    if (!raw || isPlaylistOrSectionTitle(raw)) return null;
+
+    let title = raw;
+    let artist = '';
+    const artistEl =
+      player.querySelector('[data-test-id="VIBE_PLAYERBAR_TRACK_ARTIST"]') ||
+      player.querySelector('[data-test-id="TRACK_ARTIST"]') ||
+      player.querySelector('a[href*="/artist/"]');
+    if (artistEl) {
+      artist = dedupeRepeatedText((artistEl.textContent || '').trim());
+    }
+    if (!artist) {
+      const parts = raw.split(/\s+[—–-]\s+/);
+      if (parts.length >= 2) {
+        artist = dedupeRepeatedText(parts[0]);
+        title = dedupeRepeatedText(parts.slice(1).join(' — '));
       }
     }
-    return null;
+    if (isPlaylistOrSectionTitle(title)) return null;
+
+    const link = nameEl && nameEl.closest('a');
+    const href = link && link.href ? String(link.href) : '';
+    return {
+      title,
+      artist,
+      url: /\/track\//i.test(href) ? href : '',
+      coverUrl: coverFromDom(player),
+    };
   }
 
   function readMediaSession() {
@@ -355,35 +583,62 @@
     return '';
   }
 
+  function attachProgress(payload, player, meta) {
+    const fallbackDur =
+      meta && meta.durationMs != null && Number.isFinite(Number(meta.durationMs))
+        ? Number(meta.durationMs) / 1000
+        : payload.durationSec != null
+          ? Number(payload.durationSec)
+          : null;
+    const progress = getProgress(player, fallbackDur);
+    if (progress) {
+      payload.positionSec = progress.position;
+      payload.durationSec = progress.duration;
+    } else if (
+      payload.durationSec == null &&
+      fallbackDur != null &&
+      Number.isFinite(fallbackDur) &&
+      fallbackDur > 0.5
+    ) {
+      payload.durationSec = fallbackDur;
+    }
+    return payload;
+  }
+
   function readFromDomFallback(player) {
-    const nameEl = player.querySelector('[data-test-id="VIBE_PLAYERBAR_TRACK_NAME"]');
-    let raw = nameEl ? (nameEl.textContent || '').trim() : '';
-    raw = dedupeRepeatedText(raw);
-    let title = raw;
-    let artist = '';
-    // Часто в одной строке: "artist — title" (повторённой)
-    const parts = raw.split(/\s+[—–-]\s+/);
-    if (parts.length >= 2) {
-      artist = dedupeRepeatedText(parts[0]);
-      title = dedupeRepeatedText(parts.slice(1).join(' — '));
-    }
+    const dom = readPlayerbarDomTrack(player);
     const ms = readMediaSession();
+    let title = dom && dom.title ? dom.title : '';
+    let artist = dom && dom.artist ? dom.artist : '';
+    let album = '';
+    let url = dom && dom.url ? dom.url : '';
+    let coverUrl = (dom && dom.coverUrl) || '';
+
     if (ms) {
-      if (ms.title && !isUiChromeTitle(ms.title)) title = ms.title;
-      if (ms.artist) artist = ms.artist;
+      // Media Session обычно точнее страницы плейлиста.
+      if (ms.title && !isPlaylistOrSectionTitle(ms.title)) title = ms.title;
+      if (ms.artist && !isPlaylistOrSectionTitle(ms.artist)) artist = ms.artist;
+      if (ms.album && !isPlaylistOrSectionTitle(ms.album) && ms.album !== title) album = ms.album;
+      if (ms.coverUrl) coverUrl = coverUrl || ms.coverUrl;
     }
-    if (!title || isUiChromeTitle(title)) return null;
-    const link = nameEl && nameEl.closest('a');
-    const href = link && link.href ? String(link.href) : '';
-    return {
-      source: 'client',
-      title,
-      artist,
-      album: ms && ms.album && !isUiChromeTitle(ms.album) ? ms.album : '',
-      paused: isPlaying(player) === false,
-      url: /music\.yandex\./i.test(href) ? href : '',
-      coverUrl: coverFromDom(player) || (ms && ms.coverUrl) || '',
-    };
+
+    if (!title || isPlaylistOrSectionTitle(title)) return null;
+    if (artist && (artist === title || isPlaylistOrSectionTitle(artist))) artist = '';
+    if (album && (album === title || isPlaylistOrSectionTitle(album))) album = '';
+
+    return attachProgress(
+      {
+        source: 'client',
+        title: dedupeRepeatedText(title),
+        artist: dedupeRepeatedText(artist),
+        album: dedupeRepeatedText(album),
+        paused: isPlaying(player) === false,
+        url,
+        coverUrl,
+      },
+      player,
+      null
+    );
   }
 
   function readPlayerState() {
@@ -393,54 +648,81 @@
     const playing = isPlaying(player);
     if (playing == null) return null;
 
+    const dom = readPlayerbarDomTrack(player);
+    const ms = readMediaSession();
     const meta = getTrackMeta(player);
-    if (!meta || !meta.title || isUiChromeTitle(meta.title)) {
+
+    // Приоритет: DOM playerbar / Media Session > fiber meta (meta часто = открытый плейлист).
+    let title = '';
+    let artist = '';
+    let album = '';
+    let url = '';
+    let coverUrl = '';
+
+    if (dom && dom.title) {
+      title = dom.title;
+      artist = dom.artist || '';
+      url = dom.url || '';
+      coverUrl = dom.coverUrl || '';
+    }
+    if (ms && ms.title && !isPlaylistOrSectionTitle(ms.title)) {
+      title = ms.title;
+      if (ms.artist && !isPlaylistOrSectionTitle(ms.artist)) artist = ms.artist;
+      if (ms.album && !isPlaylistOrSectionTitle(ms.album) && ms.album !== title) album = ms.album;
+      if (ms.coverUrl) coverUrl = coverUrl || ms.coverUrl;
+    }
+
+    if (meta && looksLikeTrackMeta(meta)) {
+      const metaTitle = meta.version
+        ? String(meta.title) + ' ' + String(meta.version)
+        : String(meta.title);
+      const metaArtist = artistsFromMeta(meta);
+      // Fiber meta берём, только если DOM/MS пусты или согласованы с треком.
+      if (!title || !isPlaylistOrSectionTitle(metaTitle)) {
+        if (!title || title === metaTitle || !dom) {
+          title = metaTitle;
+          if (metaArtist) artist = metaArtist;
+        } else if (dom && metaTitle === dom.title) {
+          title = metaTitle;
+          if (metaArtist) artist = metaArtist;
+        }
+      }
+      if (!album && meta.albums && meta.albums[0] && meta.albums[0].title) {
+        const alb = String(meta.albums[0].title);
+        if (!isPlaylistOrSectionTitle(alb) && alb !== title) album = alb;
+      }
+      coverUrl = coverUrl || coverUrlFromMeta(meta);
+      url = url || trackUrlFromMeta(meta);
+    }
+
+    if (!title || isPlaylistOrSectionTitle(title)) {
       return readFromDomFallback(player);
     }
+    if (artist && (artist === title || isPlaylistOrSectionTitle(artist))) artist = '';
+    if (album && (album === title || isPlaylistOrSectionTitle(album))) album = '';
 
-    const progress = getProgress(player);
-    const title = meta.version ? String(meta.title) + ' ' + String(meta.version) : String(meta.title);
-    if (isUiChromeTitle(title)) return readFromDomFallback(player);
-    const album =
-      meta.albums && meta.albums[0] && meta.albums[0].title
-        ? String(meta.albums[0].title)
-        : meta.album
-          ? String(meta.album)
-          : '';
-
-    let coverUrl = coverUrlFromMeta(meta) || coverFromDom(player);
-    if (!coverUrl) {
-      const ms = readMediaSession();
-      if (ms && ms.coverUrl) coverUrl = ms.coverUrl;
-    }
-
-    const payload = {
-      source: 'client',
-      title: dedupeRepeatedText(title),
-      artist: artistsFromMeta(meta),
-      album,
-      paused: !playing,
-      url: trackUrlFromMeta(meta),
-      coverUrl,
-    };
-
-    if (progress) {
-      payload.positionSec = progress.position;
-      payload.durationSec = progress.duration;
-    } else if (meta.durationMs != null && Number.isFinite(Number(meta.durationMs))) {
-      payload.durationSec = Number(meta.durationMs) / 1000;
-    }
-
-    return payload;
+    return attachProgress(
+      {
+        source: 'client',
+        title: dedupeRepeatedText(title),
+        artist: dedupeRepeatedText(artist),
+        album: dedupeRepeatedText(album),
+        paused: !playing,
+        url,
+        coverUrl: coverUrl || coverFromDom(player),
+      },
+      player,
+      meta
+    );
   }
 
   function collectPropKeys(element) {
     const fiberNode = findFiberNode(element);
     if (!fiberNode) return { fiber: false, keys: [] };
-    const root = getRootFiber(fiberNode);
+    const scoped = getPlayerScopedFiber(fiberNode, 14);
     const keys = [];
     const seen = Object.create(null);
-    traverseFiber(root, (fiber) => {
+    traverseFiber(scoped, (fiber) => {
       if (fiber.memoizedProps && typeof fiber.memoizedProps === 'object') {
         Object.keys(fiber.memoizedProps).forEach((k) => {
           if (!seen[k]) {
@@ -506,15 +788,34 @@
     const p = findPlayer();
     if (!p) return { no: 1 };
     const meta = getTrackMeta(p);
+    const fallbackDur =
+      meta && meta.durationMs != null && Number.isFinite(Number(meta.durationMs))
+        ? Number(meta.durationMs) / 1000
+        : null;
+    const sliders = [];
+    p.querySelectorAll('[role="slider"], input[type="range"], [data-test-id*="TIMECODE"]').forEach((el) => {
+      sliders.push({
+        id: el.getAttribute('data-test-id') || el.tagName,
+        now: el.getAttribute('aria-valuenow') || el.value || '',
+        max: el.getAttribute('aria-valuemax') || el.max || '',
+        text: (el.getAttribute('aria-valuetext') || el.textContent || '').slice(0, 60),
+      });
+    });
     return {
       sel: p.getAttribute('data-test-id'),
       playing: isPlaying(p),
       hasMeta: !!meta,
       metaTitle: meta && meta.title,
+      metaDurMs: meta && meta.durationMs,
       metaCover: meta && (meta.coverUri || meta.ogImage || ''),
-      prog: getProgress(p),
+      prog: getProgress(p, fallbackDur),
+      fiberTc: !!searchAnyProperty(p, ['timecodeClassName', 'currentTimecodeClassName']),
+      media: getProgressFromMediaElements(),
+      domText: getProgressFromDomText(p),
+      sliders: sliders.slice(0, 6),
       props: collectPropKeys(p),
       nameText: ((p.querySelector('[data-test-id="VIBE_PLAYERBAR_TRACK_NAME"]') || {}).textContent || '').slice(0, 120),
+      timeSnippet: String(p.innerText || '').replace(/\s+/g, ' ').slice(0, 200),
     };
   };
   try {

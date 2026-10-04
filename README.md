@@ -2,9 +2,9 @@
 
 Обычное приложение для Windows: Без командной строки и без лишних окон.
 
-[Скачать](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v2.1.3)
+[Скачать](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v2.2.3)
 
-Типы установщиков после **[локальной сборки:](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v2.1.3)**
+Типы установщиков после **[локальной сборки:](https://github.com/pavelinbs-afk/yamusicrpc/releases/tag/v2.2.3)**
 
 - **`.exe`** (NSIS) — обычный мастер установки, ярлык в меню «Пуск».
 - **`.msi`** — по желанию, тот же продукт в формате Windows Installer (удобно для корпоративных сценариев).

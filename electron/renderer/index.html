@@ -266,8 +266,9 @@
         <input type="checkbox" class="checkbox-lg" id="bridge-auto-install" />
       </label>
       <p class="hint">
-        При запуске RPC мост ставится сам, если его ещё нет. Перед записью asar
-        установщик <strong>принудительно закрывает Яндекс.Музыку</strong>.
+        Мост ставится сам при установке программы (.exe / .msi) и при запуске RPC
+        (в т.ч. portable), если его ещё нет. Перед записью asar
+        <strong>принудительно закрывается Яндекс.Музыка</strong>.
         Удаление отключает автоустановку, чтобы мост не вернулся при следующем старте.
       </p>
       <div class="actions">
@@ -317,8 +318,7 @@
       <p class="hint" id="discord-client-id-hint">
         Свой Application ID из
         <a href="https://discord.com/developers/applications" target="_blank" rel="noopener noreferrer">Discord Developer Portal</a>.
-        Пустое поле — встроенное приложение (статус виден только вам, пока приложение не верифицировано).
-        Чтобы друзья видели статус без верификации: создайте своё приложение, добавьте их в App Testers и укажите ID здесь.
+        Пустое поле — встроенное верифицированное приложение (статус отображается).
         Переменная окружения DISCORD_RPC_CLIENT_ID имеет приоритет над этим полем.
       </p>
       <div class="actions" style="margin-top:8px">

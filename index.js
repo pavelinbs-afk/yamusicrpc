@@ -2929,14 +2929,7 @@ async function main() {
   log('Discord Application ID:', getActiveClientId(), `(${describeClientIdSource()})`);
 
   if (clientIdSource(runtimeConfig) === 'builtin') {
-    log('⚠ Внимание: встроенное приложение Discord НЕ верифицировано.');
-    log('  Статус будет виден только вам. Другие пользователи его не увидят.');
-    log('  Чтобы друзья тоже видели статус (без верификации):');
-    log('  1. Создайте своё приложение на https://discord.com/developers/applications');
-    log('  2. В разделе Rich Presence → Art Assets загрузите иконку (любую картинку)');
-    log('  3. В App Settings → App Testers добавьте Discord-юзернеймы друзей');
-    log('  4. Укажите Application ID в настройках приложения (раздел Discord) или через DISCORD_RPC_CLIENT_ID');
-    log('  Верификация приложения не нужна — достаточно добавить друзей в тестеры.');
+    log('Приложение верифицировано и статус отображается.');
   }
 
   if (process.env.RPC_EMBEDDED_IN_ELECTRON !== '1') {

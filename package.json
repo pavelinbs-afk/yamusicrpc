@@ -1,6 +1,6 @@
 {
   "name": "yandex-music-discord-rpc",
-  "version": "2.2.4",
+  "version": "2.2.5",
   "description": "Официальное приложение RPC для статуса в Discord",
   "author": "Yandex Music RPC",
   "main": "electron/main.js",
@@ -92,6 +92,7 @@
     "nsis": {
       "oneClick": true,
       "runAfterFinish": true,
+      "include": "build/installer.nsh",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Yandex Music RPC",
@@ -103,6 +104,7 @@
     },
     "msi": {
       "oneClick": true,
+      "runAfterFinish": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Yandex Music RPC",

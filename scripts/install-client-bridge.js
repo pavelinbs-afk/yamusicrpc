@@ -458,12 +458,27 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const asarPath = resolveAsarPath(args.asar);
 
+  const soft = process.env.YM_RPC_BRIDGE_INSTALL_SOFT === '1'
+    || process.argv.includes('--soft');
+
   if (args.status) {
     const st = status(asarPath);
     console.log(JSON.stringify(st, null, 2));
     process.exit(st.ok ? 0 : 1);
   }
   if (!asarPath) {
+    const payload = {
+      ok: soft,
+      installed: false,
+      skipped: true,
+      reason: 'yandex_music_not_found',
+      error: 'Не найден app.asar Яндекс.Музыки.',
+    };
+    console.log(JSON.stringify(payload, null, 2));
+    if (soft) {
+      console.error('Яндекс.Музыка не найдена — мост будет установлен при следующем запуске RPC.');
+      process.exit(0);
+    }
     console.error('Не найден app.asar Яндекс.Музыки.');
     process.exit(2);
   }

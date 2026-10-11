@@ -7,6 +7,10 @@ const { projectRoot, getScriptsDir } = require('./paths');
 const { getAppIconPath } = require('./icon-path');
 const lifecycle = require('./app-lifecycle');
 const {
+  wantsInstallClientBridgeFlag,
+  runInstallClientBridgeCli,
+} = require('./install-bridge-cli');
+const {
   createSettingsWindow,
   showSettingsWindow,
   getSettingsWindow,
@@ -15,6 +19,14 @@ const {
 } = require('./settings-window');
 
 const indexEntryPath = path.join(projectRoot(), 'index.js');
+
+/** Тихая установка моста из NSIS/MSI (без окна). */
+if (wantsInstallClientBridgeFlag()) {
+  app.whenReady().then(async () => {
+    const code = await runInstallClientBridgeCli();
+    try { app.exit(code); } catch (_) { process.exit(code); }
+  });
+} else {
 
 /** @type {Electron.Tray | null} */
 let tray = null;
@@ -183,3 +195,5 @@ if (!gotLock) {
     createTray();
   });
 }
+
+} // end normal app (not --install-client-bridge)

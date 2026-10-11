@@ -240,6 +240,10 @@
               dlog(
                 'posted ok title=' +
                   payload.title +
+                  ' artist=' +
+                  (payload.artist || '') +
+                  ' album=' +
+                  (payload.album || '') +
                   ' cover=' +
                   (payload.coverUrl ? 'yes' : 'no') +
                   ' paused=' +

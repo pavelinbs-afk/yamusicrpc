@@ -128,6 +128,8 @@ let lastSentTrackKey = null;
 let lastSentButtonUrl = null;
 /** Последний largeImageKey, ушедший в Discord — чтобы форсить апдейт при появлении обложки. */
 let lastSentCoverKey = '';
+/** Последний largeImageText (альбом) — форс апдейт когда доехал альбом. */
+let lastSentLargeText = '';
 /** Уже отправили в Discord activity с валидным start/end (тайм-бар). */
 let lastSentHadTimestamps = false;
 let lastDiscordActivityAt = 0;
@@ -440,6 +442,7 @@ function resetTrackSessionState() {
   lastSentTrackKey = null;
   lastSentButtonUrl = null;
   lastSentCoverKey = '';
+  lastSentLargeText = '';
   lastSentHadTimestamps = false;
   lastDiscordActivityAt = 0;
   lastNowPlaying = { title: '', artist: '' };
@@ -961,6 +964,54 @@ function fetchCoverFromYandexApi(title, artist, album) {
   return promise;
 }
 
+/** Кэш названия альбома (когда мост не прислал album). */
+const albumNameCache = new Map();
+
+/** Достать название альбома из Deezer (для 3-й строки Discord). */
+function fetchAlbumTitleFromDeezer(title, artist) {
+  const key = [title, artist].filter(Boolean).join(' ').trim().toLowerCase();
+  if (!key) return Promise.resolve('');
+  const cached = albumNameCache.get(key);
+  if (cached && Date.now() - cached.ts < COVER_CACHE_TTL_MS) {
+    return Promise.resolve(cached.album || '');
+  }
+  const q = encodeURIComponent(`${title} ${artist}`.trim());
+  const url = `https://api.deezer.com/search?q=${q}&limit=1`;
+  return new Promise((resolve) => {
+    const req = https.get(url, {
+      headers: { 'User-Agent': 'YandexMusicRPC/2.0' },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) {
+            albumNameCache.set(key, { album: '', ts: Date.now() });
+            resolve('');
+            return;
+          }
+          const j = JSON.parse(data);
+          const track = j.data && j.data[0];
+          const album = track && track.album && track.album.title ? String(track.album.title).trim() : '';
+          albumNameCache.set(key, { album, ts: Date.now() });
+          resolve(album);
+        } catch (_) {
+          albumNameCache.set(key, { album: '', ts: Date.now() });
+          resolve('');
+        }
+      });
+    });
+    req.on('error', () => {
+      albumNameCache.set(key, { album: '', ts: Date.now() });
+      resolve('');
+    });
+    req.setTimeout(4000, () => {
+      try { req.destroy(); } catch (_) {}
+      resolve('');
+    });
+  });
+}
+
 /** Фолбек: поиск обложки через публичное API Deezer */
 function fetchCoverFromDeezerApi(title, artist, cacheKey) {
   const q = encodeURIComponent(`${title} ${artist}`.trim());
@@ -988,6 +1039,10 @@ function fetchCoverFromDeezerApi(title, artist, cacheKey) {
         try {
           const j = JSON.parse(data);
           const track = j.data && j.data[0];
+          if (track && track.album && track.album.title) {
+            const ak = [title, artist].filter(Boolean).join(' ').trim().toLowerCase();
+            if (ak) albumNameCache.set(ak, { album: String(track.album.title).trim(), ts: Date.now() });
+          }
           const coverUrl = track && track.album && track.album.cover_big;
           if (coverUrl && /^https?:\/\//i.test(coverUrl)) {
             log('DEBUG cover from Deezer:', { cacheKey, coverUrl });
@@ -1149,14 +1204,26 @@ function tryDirectTrackPage(q, cacheKey, resolve) {
     });
 }
 
+/**
+ * 3-я строка Listening (largeImageText рядом с обложкой): название альбома.
+ * 1-я строка (details) — трек; 2-я (state) — артист.
+ */
+function discordCoverCaption(track) {
+  const junk = isYandexAppMarketingTitle(
+    track && track.title,
+    track && track.artist,
+    track && track.album,
+  );
+  const album = !junk && track && track.album ? String(track.album).trim() : '';
+  if (album) return discordAssetText(album);
+  return discordAssetText('Яндекс.Музыка');
+}
+
 function pickLargeImage(track) {
   const cover = track && track.coverUrl;
+  const caption = discordCoverCaption(track || {});
   if (runtimeConfig.coverArtEnabled && cover && isAllowedCoverUrl(cover)) {
-    const junk = isYandexAppMarketingTitle(track.title, track.artist, track.album);
-    const text = discordAssetText(
-      junk ? 'Яндекс.Музыка' : (track.album || track.title || 'Яндекс.Музыка'),
-    );
-    return { key: cover.slice(0, 512), text };
+    return { key: cover.slice(0, 512), text: caption };
   }
   if (cover) {
     log('DEBUG cover rejected:', { coverArtEnabled: runtimeConfig.coverArtEnabled, coverLen: cover.length, coverPrefix: cover.slice(0, 80) });
@@ -1166,20 +1233,28 @@ function pickLargeImage(track) {
   // или явный ключ из настроек (Rich Presence → Art Assets).
   const customAsset = (runtimeConfig.discordLargeImageKey || '').trim();
   if (customAsset) {
-    return { key: customAsset.slice(0, 256), text: 'Яндекс.Музыка' };
+    return { key: customAsset.slice(0, 256), text: caption };
   }
   if (clientIdSource(runtimeConfig) === 'builtin') {
-    return { key: 'yandex_music_icon', text: 'Яндекс.Музыка' };
+    return { key: 'yandex_music_icon', text: caption };
   }
-  return { key: '', text: 'Яндекс.Музыка' };
+  return { key: '', text: caption };
 }
 
-function applyDiscordButtonsToPayload(payload, trackUrl) {
-  if (!trackUrl) return;
+/**
+ * @param {object} payload
+ * @param {string} trackUrl
+ * @param {{ allowModButton?: boolean }} [opts]
+ *   allowModButton=false — только кнопка трека (нужно с тайм-баром: 2-я кнопка «мод» глушит status).
+ */
+function applyDiscordButtonsToPayload(payload, trackUrl, opts = {}) {
+  if (!trackUrl || !payload) return;
+  stripDiscordButtonsFromPayload(payload);
   const cfg = runtimeConfig;
   const label1 = DISCORD_FIXED_TRACK_BTN_LABEL.slice(0, 32);
   const buttons = [{ label: label1, url: trackUrl }];
-  if (cfg.discordShowModButton !== false) {
+  const allowMod = opts.allowModButton === true && cfg.discordShowModButton === true;
+  if (allowMod) {
     const l2 = DISCORD_FIXED_MOD_BTN_LABEL.slice(0, 32);
     const u2 = DISCORD_FIXED_MOD_BTN_URL.trim();
     if (u2 && /^https?:\/\//i.test(u2)) {
@@ -1194,6 +1269,23 @@ function applyDiscordButtonsToPayload(payload, trackUrl) {
     payload.button2_url = buttons[1].url;
   }
 }
+
+function stripDiscordButtonsFromPayload(payload) {
+  if (!payload) return;
+  delete payload.buttons;
+  delete payload.button1_label;
+  delete payload.button1_url;
+  delete payload.button2_label;
+  delete payload.button2_url;
+}
+
+/**
+ * После нескольких отказов Discord на «тайм-бар + кнопки» временно не пробуем комбинацию,
+ * чтобы не мигать статусом. Сброс через ~10 мин или при смене трека/URL.
+ */
+let buttonsWithTimelineBlockedUntil = 0;
+let buttonsWithTimelineFailStreak = 0;
+let lastButtonsComboTrackUrl = '';
 
 /**
  * Таймстампы для Discord Listening (type=2): нужна пара start/end (см. discord-rpc #227, Lachee).
@@ -1276,7 +1368,7 @@ function resolveDiscordListeningTimestamps(track, elapsedSec, totalSec, nowMs, o
 async function setActivity(track) {
   if (!rpc || !runtimeConfig.rpcEnabled) return;
   desiredPresence = { kind: 'playing', track: { ...track } };
-  const { title = '', artist = '', album = '', url: trackUrl, positionSec, durationSec } = track;
+  const { title = '', artist = '', url: trackUrl, positionSec, durationSec } = track;
 
   const p = typeof positionSec === 'number' && Number.isFinite(positionSec) ? Math.max(0, positionSec) : 0;
   const d = typeof durationSec === 'number' && Number.isFinite(durationSec) ? Math.max(0, durationSec) : 0;
@@ -1286,9 +1378,10 @@ async function setActivity(track) {
   const posStr = formatTime(elapsedSec);
   const durStr = totalSec > 0 ? formatTime(totalSec) : null;
   const timePart = posStr && durStr ? `${posStr}/${durStr}` : posStr || '';
+  // Listening: 1) details = трек, 2) state = артист, 3) largeImageText = альбом
   const details = discordClampText(title || 'Яндекс.Музыка', 128);
-  const stateBase = [artist || '', album || ''].filter(Boolean).join(' — ');
-  const state = stateBase ? discordClampText(stateBase, 128) : undefined;
+  const artistLine = (artist || '').trim();
+  const state = artistLine ? discordClampText(artistLine, 128) : undefined;
   const img = pickLargeImage(track);
   try {
     const now = Date.now();
@@ -1335,36 +1428,92 @@ async function setActivity(track) {
         nowMs: nowMsRpc,
       });
     }
-    // Кнопки + тайм-бар Listening Discord иногда отвергает целиком (статус пропадает у всех).
-    // При тайм-баре кнопки не шлём; без тайм-бара — оставляем.
-    if (trackUrl && !timestampsOk) {
-      applyDiscordButtonsToPayload(payload, trackUrl);
+
+    const tryButtonsWithTimeline =
+      Boolean(trackUrl) &&
+      timestampsOk &&
+      runtimeConfig.discordTryButtonsWithTimeline !== false &&
+      Date.now() >= buttonsWithTimelineBlockedUntil;
+    const wantButtons = Boolean(trackUrl) && (
+      !timestampsOk || tryButtonsWithTimeline
+    );
+    // С тайм-баром — только 1 кнопка (трек). Вторая («мод») у Listening глушит весь status.
+    const buttonOpts = { allowModButton: !timestampsOk };
+    if (wantButtons) {
+      applyDiscordButtonsToPayload(payload, trackUrl, buttonOpts);
       if (trackUrl !== lastSentButtonUrl) {
-        log('Кнопка в Discord:', trackUrl);
+        log(
+          'Кнопка в Discord:',
+          trackUrl,
+          timestampsOk ? '(с тайм-баром, только трек)' : '(без тайм-бара)',
+          buttonOpts.allowModButton && runtimeConfig.discordShowModButton ? '+мод' : '',
+        );
         lastSentButtonUrl = trackUrl;
       }
     }
+
+    let usedTimestamps = timestampsOk;
+    let usedButtons = wantButtons;
     try {
       await runSerializedRpcWrite(() => rpc.setActivity(payload));
+      if (tryButtonsWithTimeline) {
+        buttonsWithTimelineFailStreak = 0;
+      }
     } catch (e1) {
-      // Если payload с тайм-баром отвергнут — не оставляем пустой статус: шлём без timestamps.
-      if (timestampsOk) {
+      // 1) Тайм-бар + кнопки → убрать кнопки, оставить тайм-бар (приоритет статуса).
+      if (timestampsOk && wantButtons) {
+        log('setActivity тайм-бар+кнопки failed, retry без кнопок:', e1.message);
+        stripDiscordButtonsFromPayload(payload);
+        usedButtons = false;
+        try {
+          await runSerializedRpcWrite(() => rpc.setActivity(payload));
+          buttonsWithTimelineFailStreak += 1;
+          if (buttonsWithTimelineFailStreak >= 2) {
+            buttonsWithTimelineBlockedUntil = Date.now() + 10 * 60 * 1000;
+            log('Кнопки с тайм-баром временно отключены на 10 мин (Discord отклоняет комбинацию).');
+          }
+        } catch (e2) {
+          // 2) Совсем без тайм-бара, но с кнопками (тут можно и мод).
+          log('setActivity только тайм-бар failed, retry без тайм-бара:', e2.message);
+          delete payload.startTimestamp;
+          delete payload.endTimestamp;
+          usedTimestamps = false;
+          if (trackUrl) {
+            applyDiscordButtonsToPayload(payload, trackUrl, { allowModButton: true });
+            usedButtons = true;
+          }
+          await runSerializedRpcWrite(() => rpc.setActivity(payload));
+        }
+      } else if (timestampsOk) {
         log('setActivity с тайм-баром failed, retry without timestamps:', e1.message);
-        const fallback = { ...payload };
-        delete fallback.startTimestamp;
-        delete fallback.endTimestamp;
-        if (trackUrl) applyDiscordButtonsToPayload(fallback, trackUrl);
-        await runSerializedRpcWrite(() => rpc.setActivity(fallback));
+        delete payload.startTimestamp;
+        delete payload.endTimestamp;
+        usedTimestamps = false;
+        if (trackUrl) {
+          applyDiscordButtonsToPayload(payload, trackUrl, { allowModButton: true });
+          usedButtons = true;
+        }
+        await runSerializedRpcWrite(() => rpc.setActivity(payload));
       } else {
         throw e1;
       }
     }
+    if (trackUrl && trackUrl !== lastButtonsComboTrackUrl) {
+      lastButtonsComboTrackUrl = trackUrl;
+      // Новый трек — даём комбинации ещё один шанс, если блок не жёсткий.
+      if (buttonsWithTimelineFailStreak > 0 && Date.now() >= buttonsWithTimelineBlockedUntil) {
+        buttonsWithTimelineFailStreak = 0;
+      }
+    }
     lastSentCoverKey = img.key || '';
-    lastSentHadTimestamps = timestampsOk;
+    lastSentLargeText = img.text || '';
+    lastSentHadTimestamps = usedTimestamps;
     log(
       'Статус обновлён в Discord',
       `(${timePart || '—'})`,
-      timestampsOk ? '(тайм-бар = трек, start/end)' : '(без тайм-бара)',
+      usedTimestamps ? '(тайм-бар)' : '(без тайм-бара)',
+      usedButtons ? '(кнопки)' : '(без кнопок)',
+      lastSentLargeText ? `coverText=${lastSentLargeText}` : '',
     );
   } catch (e) {
     log('Ошибка setActivity:', e.message);
@@ -1376,6 +1525,7 @@ async function setPausedActivity(_track) {
   desiredPresence = { kind: 'clear', track: null };
   await clearActivity({ silent: true });
   lastSentCoverKey = '';
+  lastSentLargeText = '';
   log('Статус скрыт: пауза (без отдельного статуса приостановки)');
 }
 
@@ -1514,6 +1664,92 @@ function publicConfigSnapshot() {
   delete c.discordModButtonLabel;
   delete c.discordModButtonUrl;
   return c;
+}
+
+/** Состояние автоустановки моста (для UI /api/bridge). */
+let bridgeAutoState = {
+  lastCheckAt: 0,
+  lastStatus: null,
+  lastAutoAttemptAt: 0,
+  lastAutoOk: null,
+  lastAutoError: null,
+  inProgress: false,
+};
+
+function enrichBridgeStatus(st) {
+  const base = st && typeof st === 'object' ? st : { ok: false, installed: false };
+  return {
+    ...base,
+    bridgeAutoInstall: runtimeConfig.bridgeAutoInstall !== false,
+    auto: {
+      ...bridgeAutoState,
+      lastStatus: undefined, // не дублируем весь статус
+    },
+  };
+}
+
+/**
+ * Проверить мост и при необходимости установить (тихий фон при старте).
+ * @param {{ force?: boolean, reason?: string }} [opts]
+ */
+async function ensureClientBridgeInstalled(opts = {}) {
+  if (bridgeAutoState.inProgress) {
+    return { ok: false, skipped: true, reason: 'in_progress' };
+  }
+  const force = opts.force === true;
+  const autoEnabled = runtimeConfig.bridgeAutoInstall !== false;
+  if (!force && !autoEnabled) {
+    return { ok: true, skipped: true, reason: 'auto_disabled' };
+  }
+  bridgeAutoState.inProgress = true;
+  try {
+    let st;
+    try {
+      st = await runBridgeCli(['--status']);
+    } catch (e) {
+      bridgeAutoState.lastCheckAt = Date.now();
+      bridgeAutoState.lastAutoError = String(e && e.message ? e.message : e);
+      return { ok: false, error: bridgeAutoState.lastAutoError };
+    }
+    bridgeAutoState.lastCheckAt = Date.now();
+    bridgeAutoState.lastStatus = st;
+    if (st && st.installed) {
+      log('Мост в клиенте: уже установлен', st.asarPath || '');
+      return { ok: true, installed: true, already: true, ...st };
+    }
+    if (!force && !autoEnabled) {
+      return { ok: true, installed: false, skipped: true };
+    }
+    log('Мост в клиенте: автоустановка…', opts.reason || '');
+    bridgeAutoState.lastAutoAttemptAt = Date.now();
+    const result = await runBridgeCli([]);
+    bridgeAutoState.lastStatus = result;
+    if (result && result.ok !== false && result.installed !== false) {
+      bridgeAutoState.lastAutoOk = true;
+      bridgeAutoState.lastAutoError = null;
+      log('Мост в клиенте: установлен автоматически', result.asarPath || '');
+      return { ok: true, installed: true, auto: true, ...result };
+    }
+    const err = (result && result.error) || 'bridge install failed';
+    bridgeAutoState.lastAutoOk = false;
+    bridgeAutoState.lastAutoError = err;
+    log('Мост в клиенте: автоустановка не удалась —', err);
+    return { ok: false, error: err, ...(result || {}) };
+  } catch (e) {
+    const err = String(e && e.message ? e.message : e);
+    bridgeAutoState.lastAutoOk = false;
+    bridgeAutoState.lastAutoError = err;
+    log('Мост в клиенте: ошибка автоустановки —', err);
+    // Если Яндекс.Музыка держит asar — повторим через несколько минут.
+    if (/EBUSY|busy|locked|занят/i.test(err)) {
+      setTimeout(() => {
+        ensureClientBridgeInstalled({ reason: 'retry_after_busy' }).catch(() => {});
+      }, 3 * 60 * 1000);
+    }
+    return { ok: false, error: err };
+  } finally {
+    bridgeAutoState.inProgress = false;
+  }
 }
 
 function mergeConfigPatch(patch) {
@@ -1870,6 +2106,8 @@ function runHttpServer() {
         activeSource: lastActiveSource,
         clientBridgeFresh:
           Date.now() - lastPrioritySourcePostAt < runtimeConfig.desktopBrowserPriorityMs,
+        bridgeAutoInstall: runtimeConfig.bridgeAutoInstall !== false,
+        bridgeInstalled: !!(bridgeAutoState.lastStatus && bridgeAutoState.lastStatus.installed),
         discordClientId: getActiveClientId(),
         discordClientIdSource: clientIdSource(runtimeConfig),
         discordClientIdBuiltin: BUILTIN_DISCORD_CLIENT_ID,
@@ -1883,15 +2121,17 @@ function runHttpServer() {
       (async () => {
         try {
           const st = await runBridgeCli(['--status']);
+          bridgeAutoState.lastCheckAt = Date.now();
+          bridgeAutoState.lastStatus = st;
           res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(st));
+          res.end(JSON.stringify(enrichBridgeStatus(st)));
         } catch (e) {
           res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
+          res.end(JSON.stringify(enrichBridgeStatus({
             ok: false,
             installed: false,
             error: String(e && e.message ? e.message : e),
-          }));
+          })));
         }
       })();
       return;
@@ -1903,31 +2143,43 @@ function runHttpServer() {
         (async () => {
           try {
             let asarPath = null;
+            let disableAuto = false;
             try {
               const j = JSON.parse(body || '{}');
               asarPath = j.asarPath || null;
+              disableAuto = j.disableAutoInstall === true;
             } catch (_) {}
-            const args = req.url === '/api/bridge/uninstall' ? ['--uninstall'] : [];
+            const isUninstall = req.url === '/api/bridge/uninstall';
+            const args = isUninstall ? ['--uninstall'] : [];
             if (asarPath) args.push(`--asar=${asarPath}`);
             // Тяжёлая упаковка asar — в дочернем процессе, иначе UI Electron зависает.
             const result = await runBridgeCli(args);
             if (!result || result.ok === false) {
               res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
-              res.end(JSON.stringify(result || { ok: false, error: 'bridge cli failed' }));
+              res.end(JSON.stringify(enrichBridgeStatus(result || { ok: false, error: 'bridge cli failed' })));
               return;
             }
             log(
-              req.url === '/api/bridge/uninstall' ? 'Client bridge uninstalled:' : 'Client bridge installed:',
+              isUninstall ? 'Client bridge uninstalled:' : 'Client bridge installed:',
               result.asarPath || asarPath || '',
             );
+            bridgeAutoState.lastStatus = result;
+            bridgeAutoState.lastCheckAt = Date.now();
+            // После ручного удаления не ставим мост снова при следующем запуске.
+            if (isUninstall || disableAuto) {
+              const merged = mergeConfigPatch({ bridgeAutoInstall: false });
+              saveConfig(merged);
+              reloadRuntimeConfig();
+              log('Автоустановка моста отключена (после удаления).');
+            }
             res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(result));
+            res.end(JSON.stringify(enrichBridgeStatus(result)));
           } catch (e) {
             res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
+            res.end(JSON.stringify(enrichBridgeStatus({
               ok: false,
               error: String(e && e.message ? e.message : e),
-            }));
+            })));
           }
         })();
       });
@@ -2062,7 +2314,7 @@ function runHttpServer() {
             res.end(JSON.stringify({ ok: true, ignored: true }));
             return;
           }
-          const album = msg.album || '';
+          let album = typeof msg.album === 'string' ? msg.album.trim() : '';
           let coverUrl = typeof msg.coverUrl === 'string' ? msg.coverUrl.trim() : '';
           if (coverUrl && !isAllowedCoverUrl(coverUrl)) coverUrl = '';
           // Для десктопа без готового URL — ищем обложку (title+artist+album).
@@ -2086,6 +2338,18 @@ function runHttpServer() {
                   coverUrl = late.url;
                 }
               }
+            }
+          }
+          // 3-я строка Discord = альбом — если мост не дал album, добираем из Deezer.
+          if (!album && title && artist) {
+            const fromCache = albumNameCache.get([title, artist].join(' ').trim().toLowerCase());
+            if (fromCache && fromCache.album) {
+              album = fromCache.album;
+            } else {
+              album = (await Promise.race([
+                fetchAlbumTitleFromDeezer(title, artist),
+                new Promise((r) => setTimeout(() => r(''), 1200)),
+              ])) || '';
             }
           }
           if (isYandexAppMarketingTitle(title, artist, album)) {
@@ -2470,6 +2734,7 @@ function runHttpServer() {
                 await clearActivity({ silent: false });
                 lastSentTrackKey = '__cleared_pause__';
                 lastSentCoverKey = '';
+                lastSentLargeText = '';
                 lastDiscordActivityAt = now;
                 positionStuckSinceMs = null;
                 pausedSinceMs = now; // не спамим clearActivity
@@ -2511,6 +2776,8 @@ function runHttpServer() {
             const nextCoverKey =
               coverUrl && isAllowedCoverUrl(coverUrl) ? coverUrl.slice(0, 512) : '';
             const needCoverFix = Boolean(nextCoverKey) && nextCoverKey !== lastSentCoverKey;
+            const nextLargeText = discordCoverCaption({ title, artist, album, coverUrl });
+            const needCaptionFix = Boolean(nextLargeText) && nextLargeText !== lastSentLargeText;
             const samePlayingTrack =
               key === lastSentTrackKey &&
               lastSentTrackKey !== '__cleared_pause__' &&
@@ -2544,6 +2811,7 @@ function runHttpServer() {
               timelineSeeked ||
               clientTimelineResync ||
               needCoverFix ||
+              needCaptionFix ||
               needHeartbeat;
             if (!canUpdate) {
               log('DEBUG throttled:', {
@@ -2680,6 +2948,11 @@ async function main() {
 
   runHttpServer();
   startDesktopPoller();
+
+  // Автоустановка моста после старта (не блокируем Discord/HTTP).
+  setTimeout(() => {
+    ensureClientBridgeInstalled({ reason: 'startup' }).catch(() => {});
+  }, 2500);
 
   setInterval(() => {
     if (!hasLoggedFirstMsg) {

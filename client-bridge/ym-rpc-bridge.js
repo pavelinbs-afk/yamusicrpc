@@ -583,6 +583,21 @@
     return '';
   }
 
+  function albumFromMeta(meta) {
+    if (!meta || typeof meta !== 'object') return '';
+    if (typeof meta.album === 'string' && meta.album.trim()) return meta.album.trim();
+    if (meta.album && typeof meta.album === 'object' && meta.album.title) {
+      return String(meta.album.title).trim();
+    }
+    if (Array.isArray(meta.albums) && meta.albums[0]) {
+      const a0 = meta.albums[0];
+      if (a0 && a0.title) return String(a0.title).trim();
+      if (a0 && a0.name) return String(a0.name).trim();
+    }
+    if (typeof meta.albumName === 'string' && meta.albumName.trim()) return meta.albumName.trim();
+    return '';
+  }
+
   function attachProgress(payload, player, meta) {
     const fallbackDur =
       meta && meta.durationMs != null && Number.isFinite(Number(meta.durationMs))
@@ -687,9 +702,10 @@
           if (metaArtist) artist = metaArtist;
         }
       }
-      if (!album && meta.albums && meta.albums[0] && meta.albums[0].title) {
-        const alb = String(meta.albums[0].title);
-        if (!isPlaylistOrSectionTitle(alb) && alb !== title) album = alb;
+      if (!album) {
+        const alb = albumFromMeta(meta);
+        // Альбом может совпадать с названием (сингл) — для 3-й строки Discord всё равно нужен.
+        if (alb && !isPlaylistOrSectionTitle(alb)) album = alb;
       }
       coverUrl = coverUrl || coverUrlFromMeta(meta);
       url = url || trackUrlFromMeta(meta);
@@ -699,7 +715,7 @@
       return readFromDomFallback(player);
     }
     if (artist && (artist === title || isPlaylistOrSectionTitle(artist))) artist = '';
-    if (album && (album === title || isPlaylistOrSectionTitle(album))) album = '';
+    if (album && isPlaylistOrSectionTitle(album)) album = '';
 
     return attachProgress(
       {

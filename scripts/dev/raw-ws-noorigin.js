@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 
 const clientIdFile = path.join(__dirname, '..', 'logs', 'discord-client-id.txt');
-let clientId = process.env.DISCORD_RPC_CLIENT_ID || '1475270523733807104';
+let clientId = process.env.DISCORD_RPC_CLIENT_ID || '1551603734243704933';
 try {
   if (fs.existsSync(clientIdFile)) {
     const v = fs.readFileSync(clientIdFile, 'utf8').trim();

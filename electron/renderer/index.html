@@ -307,23 +307,29 @@
         <input type="checkbox" class="checkbox-lg" id="discord-show-mod-btn" />
       </label>
       <p class="hint">
-        Кликабельная кнопка «мод» с тайм-баром Listening обычно гасит статус.
-        С тайм-баром она всё равно не отправляется. Лучше держать выключенной
-        и пользоваться «Упоминание мода на обложке».
+        По умолчанию в Discord — «Слушать трек». Если включено: RPC дополнительно
+        пытается отправить вторую кнопку (мод), не заменяя и не убирая первую.
+        При отказе Discord останется только «Слушать трек».
       </p>
 
       <label class="row" style="margin-top:16px"><span>Discord Application ID</span></label>
+      <select id="discord-client-id-preset" style="margin-top:6px">
+        <option value="1551603734243704933">Основной — 1551603734243704933</option>
+        <option value="1475270523733807104">Альтернатива 1 — 1475270523733807104</option>
+        <option value="1509556524299587624">Альтернатива 2 — 1509556524299587624</option>
+        <option value="custom">Свой Application ID…</option>
+      </select>
       <input type="text" id="discord-client-id" inputmode="numeric" autocomplete="off"
-        placeholder="Оставьте пустым для встроенного ID" spellcheck="false" />
+        placeholder="Введите свой Application ID" spellcheck="false"
+        style="margin-top:8px; display:none" />
       <p class="hint" id="discord-client-id-hint">
-        Свой Application ID из
+        Выберите один из основных ID или укажите свой из
         <a href="https://discord.com/developers/applications" target="_blank" rel="noopener noreferrer">Discord Developer Portal</a>.
-        Пустое поле — встроенное верифицированное приложение (статус отображается).
-        Переменная окружения DISCORD_RPC_CLIENT_ID имеет приоритет над этим полем.
+        По умолчанию — «Основной». Переменная DISCORD_RPC_CLIENT_ID имеет приоритет над этим полем.
       </p>
       <div class="actions" style="margin-top:8px">
         <button type="button" class="primary" id="btn-save-discord-id">Сохранить Application ID</button>
-        <button type="button" class="ghost" id="btn-reset-discord-id">Сбросить</button>
+        <button type="button" class="ghost" id="btn-reset-discord-id">Сбросить на основной</button>
       </div>
     </section>
 
@@ -476,15 +482,18 @@
           '<strong>Application ID:</strong> ' + (j.discordClientId || '—') +
             (j.discordClientIdSource ? ' (' + (
               j.discordClientIdSource === 'env' ? 'из переменной окружения' :
-              j.discordClientIdSource === 'config' ? 'из настроек' : 'встроенный'
+              j.discordClientIdSource === 'config' ? 'из настроек' : 'основной'
             ) + ')' : '') + '<br/>' +
           '<strong>Конфиг:</strong> ' + (j.configDir || '—');
         applyNowPlayingToBar(j);
+        if (Array.isArray(j.discordClientIdPresets) && j.discordClientIdPresets.length) {
+          rebuildDiscordIdPresets(j.discordClientIdPresets);
+        }
         try {
           const jc = await fetchJsonRetry(API + '/api/config', 5, 200);
           if (jc.ok && jc.config) {
             applyTheme(jc.config);
-            fillForm(jc.config);
+            fillForm(jc.config, j.discordClientId || '');
           }
         } catch (_) {}
       } catch (e) {
@@ -493,7 +502,70 @@
       }
     }
 
-    function fillForm(cfg) {
+    const DEFAULT_DISCORD_ID = '1551603734243704933';
+    const FALLBACK_DISCORD_PRESETS = [
+      { id: '1551603734243704933', label: 'Основной' },
+      { id: '1475270523733807104', label: 'Альтернатива 1' },
+      { id: '1509556524299587624', label: 'Альтернатива 2' },
+    ];
+
+    function rebuildDiscordIdPresets(presets) {
+      const sel = $('discord-client-id-preset');
+      if (!sel) return;
+      const list = (presets && presets.length) ? presets : FALLBACK_DISCORD_PRESETS;
+      const prev = sel.value;
+      sel.innerHTML = '';
+      list.forEach((p) => {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = (p.label || 'ID') + ' — ' + p.id;
+        sel.appendChild(opt);
+      });
+      const custom = document.createElement('option');
+      custom.value = 'custom';
+      custom.textContent = 'Свой Application ID…';
+      sel.appendChild(custom);
+      if (prev && Array.from(sel.options).some((o) => o.value === prev)) {
+        sel.value = prev;
+      }
+    }
+
+    function syncDiscordIdCustomVisibility() {
+      const sel = $('discord-client-id-preset');
+      const input = $('discord-client-id');
+      if (!sel || !input) return;
+      const custom = sel.value === 'custom';
+      input.style.display = custom ? '' : 'none';
+      if (!custom) input.value = sel.value;
+    }
+
+    function applyDiscordIdToForm(cfgId, activeId) {
+      const sel = $('discord-client-id-preset');
+      const input = $('discord-client-id');
+      if (!sel || !input) return;
+      const saved = (cfgId || '').trim();
+      const effective = saved || (activeId || '').trim() || DEFAULT_DISCORD_ID;
+      const presetValues = Array.from(sel.options)
+        .map((o) => o.value)
+        .filter((v) => v && v !== 'custom');
+      if (!saved) {
+        sel.value = DEFAULT_DISCORD_ID;
+        input.value = '';
+      } else if (presetValues.includes(saved)) {
+        sel.value = saved;
+        input.value = saved;
+      } else {
+        sel.value = 'custom';
+        input.value = saved;
+      }
+      // Если в конфиге пусто, но активный ID — один из пресетов, подсветим его.
+      if (!saved && presetValues.includes(effective)) {
+        sel.value = effective;
+      }
+      syncDiscordIdCustomVisibility();
+    }
+
+    function fillForm(cfg, activeDiscordId) {
       $('rpc-enabled').checked = cfg.rpcEnabled !== false;
       $('discord-show-mod-btn').checked = cfg.discordShowModButton === true;
       if ($('discord-try-buttons-timeline')) {
@@ -502,7 +574,7 @@
       if ($('bridge-auto-install')) {
         $('bridge-auto-install').checked = cfg.bridgeAutoInstall !== false;
       }
-      $('discord-client-id').value = (cfg.discordClientId || '').trim();
+      applyDiscordIdToForm((cfg.discordClientId || '').trim(), activeDiscordId || '');
       $('theme').value = cfg.theme || 'dark';
       const fontFamilySelect = $('font-family');
       const savedFamily = (cfg.fontFamily || '').trim();
@@ -585,20 +657,39 @@
       $('discord-try-buttons-timeline').addEventListener('change', saveDiscordToggles);
     }
     async function saveDiscordClientId() {
-      const raw = ($('discord-client-id').value || '').trim();
+      const sel = $('discord-client-id-preset');
+      let raw = '';
+      if (sel && sel.value === 'custom') {
+        raw = ($('discord-client-id').value || '').trim();
+      } else if (sel && sel.value) {
+        raw = sel.value === DEFAULT_DISCORD_ID ? '' : sel.value;
+      } else {
+        raw = ($('discord-client-id').value || '').trim();
+      }
       if (raw && !/^\d{16,20}$/.test(raw)) {
         alert('Неверный Application ID: нужны 16–20 цифр (из Discord Developer Portal).');
         return;
       }
       try {
         await savePartial({ discordClientId: raw });
+        applyDiscordIdToForm(raw, raw || DEFAULT_DISCORD_ID);
       } catch (e) {
         alert(String(e && e.message ? e.message : e));
       }
     }
+    if ($('discord-client-id-preset')) {
+      $('discord-client-id-preset').addEventListener('change', () => {
+        syncDiscordIdCustomVisibility();
+        if ($('discord-client-id-preset').value !== 'custom') {
+          saveDiscordClientId();
+        }
+      });
+    }
     $('btn-save-discord-id').addEventListener('click', saveDiscordClientId);
     $('btn-reset-discord-id').addEventListener('click', () => {
+      if ($('discord-client-id-preset')) $('discord-client-id-preset').value = DEFAULT_DISCORD_ID;
       $('discord-client-id').value = '';
+      syncDiscordIdCustomVisibility();
       saveDiscordClientId();
     });
     $('btn-save-look').addEventListener('click', () => {

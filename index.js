@@ -19,6 +19,7 @@ const { loadConfig, saveConfig, getConfigDir } = require('./lib/config');
 const { createLogger } = require('./lib/logging');
 const {
   BUILTIN_DISCORD_CLIENT_ID,
+  DISCORD_CLIENT_ID_PRESETS,
   normalizeClientId,
   resolveDiscordClientId,
   clientIdSource,
@@ -88,7 +89,7 @@ function isYandexAppMarketingTitle(title, artist, album) {
 }
 
 
-const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Открыть трек';
+const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Слушать трек';
 const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Яндекс Музыка Мод';
 const DISCORD_FIXED_MOD_BTN_URL = 'https://github.com/pavelinbs-afk/yamusicrpc';
 
@@ -126,6 +127,8 @@ let currentTrackStart = null;
 let currentTrackDurationSec = null; // фиксируем длительность трека один раз при старте
 let lastSentTrackKey = null;
 let lastSentButtonUrl = null;
+/** @type {'track+mod'|'track'|'none'|null} */
+let lastLoggedButtonMode = null;
 /** Последний largeImageKey, ушедший в Discord — чтобы форсить апдейт при появлении обложки. */
 let lastSentCoverKey = '';
 /** Последний largeImageText (альбом) — форс апдейт когда доехал альбом. */
@@ -441,6 +444,7 @@ function resetTrackSessionState() {
   pendingLoopRestartAtMs = null;
   lastSentTrackKey = null;
   lastSentButtonUrl = null;
+  lastLoggedButtonMode = null;
   lastSentCoverKey = '';
   lastSentLargeText = '';
   lastSentHadTimestamps = false;
@@ -1242,25 +1246,30 @@ function pickLargeImage(track) {
 }
 
 /**
+ * Режимы кнопок Discord:
+ *  - track — «Слушать трек» (по умолчанию при включённой интеграции)
+ *  - track+mod — та же кнопка + вторая (мод); первую не заменяем и не убираем
  * @param {object} payload
  * @param {string} trackUrl
- * @param {{ allowModButton?: boolean }} [opts]
- *   allowModButton=false — только кнопка трека (нужно с тайм-баром: 2-я кнопка «мод» глушит status).
+ * @param {'track'|'track+mod'} [mode]
  */
-function applyDiscordButtonsToPayload(payload, trackUrl, opts = {}) {
-  if (!trackUrl || !payload) return;
+function applyDiscordButtonsToPayload(payload, trackUrl, mode = 'track') {
+  if (!payload) return;
   stripDiscordButtonsFromPayload(payload);
-  const cfg = runtimeConfig;
-  const label1 = DISCORD_FIXED_TRACK_BTN_LABEL.slice(0, 32);
-  const buttons = [{ label: label1, url: trackUrl }];
-  const allowMod = opts.allowModButton === true && cfg.discordShowModButton === true;
-  if (allowMod) {
-    const l2 = DISCORD_FIXED_MOD_BTN_LABEL.slice(0, 32);
-    const u2 = DISCORD_FIXED_MOD_BTN_URL.trim();
-    if (u2 && /^https?:\/\//i.test(u2)) {
-      buttons.push({ label: l2, url: u2 });
-    }
-  }
+  const modUrl = DISCORD_FIXED_MOD_BTN_URL.trim();
+  const modBtn = modUrl && /^https?:\/\//i.test(modUrl)
+    ? { label: DISCORD_FIXED_MOD_BTN_LABEL.slice(0, 32), url: modUrl }
+    : null;
+  const trackBtn = trackUrl
+    ? { label: DISCORD_FIXED_TRACK_BTN_LABEL.slice(0, 32), url: trackUrl }
+    : null;
+  if (!trackBtn) return;
+
+  /** @type {{ label: string, url: string }[]} */
+  const buttons = (mode === 'track+mod' && modBtn)
+    ? [trackBtn, modBtn]
+    : [trackBtn];
+
   payload.buttons = buttons;
   payload.button1_label = buttons[0].label;
   payload.button1_url = buttons[0].url;
@@ -1286,6 +1295,10 @@ function stripDiscordButtonsFromPayload(payload) {
 let buttonsWithTimelineBlockedUntil = 0;
 let buttonsWithTimelineFailStreak = 0;
 let lastButtonsComboTrackUrl = '';
+/** Пока активно — не пробуем вторую кнопку (мод), только «Слушать трек». */
+let modButtonBlockedUntil = 0;
+/** true — track+mod уже принимался Discord, продолжаем слать обе кнопки. */
+let modButtonComboAccepted = false;
 
 /**
  * Таймстампы для Discord Listening (type=2): нужна пара start/end (см. discord-rpc #227, Lachee).
@@ -1437,73 +1450,124 @@ async function setActivity(track) {
     const wantButtons = Boolean(trackUrl) && (
       !timestampsOk || tryButtonsWithTimeline
     );
-    // С тайм-баром — только 1 кнопка (трек). Вторая («мод») у Listening глушит весь status.
-    const buttonOpts = { allowModButton: !timestampsOk };
-    if (wantButtons) {
-      applyDiscordButtonsToPayload(payload, trackUrl, buttonOpts);
-      if (trackUrl !== lastSentButtonUrl) {
-        log(
-          'Кнопка в Discord:',
-          trackUrl,
-          timestampsOk ? '(с тайм-баром, только трек)' : '(без тайм-бара)',
-          buttonOpts.allowModButton && runtimeConfig.discordShowModButton ? '+мод' : '',
-        );
-        lastSentButtonUrl = trackUrl;
-      }
-    }
-
-    let usedTimestamps = timestampsOk;
-    let usedButtons = wantButtons;
-    try {
-      await runSerializedRpcWrite(() => rpc.setActivity(payload));
-      if (tryButtonsWithTimeline) {
-        buttonsWithTimelineFailStreak = 0;
-      }
-    } catch (e1) {
-      // 1) Тайм-бар + кнопки → убрать кнопки, оставить тайм-бар (приоритет статуса).
-      if (timestampsOk && wantButtons) {
-        log('setActivity тайм-бар+кнопки failed, retry без кнопок:', e1.message);
-        stripDiscordButtonsFromPayload(payload);
-        usedButtons = false;
-        try {
-          await runSerializedRpcWrite(() => rpc.setActivity(payload));
-          buttonsWithTimelineFailStreak += 1;
-          if (buttonsWithTimelineFailStreak >= 2) {
-            buttonsWithTimelineBlockedUntil = Date.now() + 10 * 60 * 1000;
-            log('Кнопки с тайм-баром временно отключены на 10 мин (Discord отклоняет комбинацию).');
-          }
-        } catch (e2) {
-          // 2) Совсем без тайм-бара, но с кнопками (тут можно и мод).
-          log('setActivity только тайм-бар failed, retry без тайм-бара:', e2.message);
-          delete payload.startTimestamp;
-          delete payload.endTimestamp;
-          usedTimestamps = false;
-          if (trackUrl) {
-            applyDiscordButtonsToPayload(payload, trackUrl, { allowModButton: true });
-            usedButtons = true;
-          }
-          await runSerializedRpcWrite(() => rpc.setActivity(payload));
-        }
-      } else if (timestampsOk) {
-        log('setActivity с тайм-баром failed, retry without timestamps:', e1.message);
-        delete payload.startTimestamp;
-        delete payload.endTimestamp;
-        usedTimestamps = false;
-        if (trackUrl) {
-          applyDiscordButtonsToPayload(payload, trackUrl, { allowModButton: true });
-          usedButtons = true;
-        }
-        await runSerializedRpcWrite(() => rpc.setActivity(payload));
-      } else {
-        throw e1;
-      }
-    }
+    const wantMod = runtimeConfig.discordShowModButton === true;
     if (trackUrl && trackUrl !== lastButtonsComboTrackUrl) {
       lastButtonsComboTrackUrl = trackUrl;
-      // Новый трек — даём комбинации ещё один шанс, если блок не жёсткий.
       if (buttonsWithTimelineFailStreak > 0 && Date.now() >= buttonsWithTimelineBlockedUntil) {
         buttonsWithTimelineFailStreak = 0;
       }
+      // Новый трек — снова пробуем вторую кнопку (если галочка включена).
+      if (wantMod) modButtonBlockedUntil = 0;
+    }
+    const modAllowedNow = wantMod && Date.now() >= modButtonBlockedUntil;
+    // Первую кнопку («Слушать трек») не заменяем и не убираем ради мода.
+    /** @type {Array<'track+mod'|'track'>} */
+    const buttonModes = !wantButtons
+      ? []
+      : modAllowedNow
+        ? ['track+mod', 'track']
+        : ['track'];
+
+    let usedTimestamps = timestampsOk;
+    let usedButtons = false;
+    /** @type {'track+mod'|'track'|'none'} */
+    let usedButtonMode = 'none';
+    let lastBtnErr = null;
+    let activityOk = false;
+
+    if (buttonModes.length) {
+      for (const mode of buttonModes) {
+        applyDiscordButtonsToPayload(payload, trackUrl, mode);
+        try {
+          await runSerializedRpcWrite(() => rpc.setActivity(payload));
+          usedButtons = true;
+          usedButtonMode = mode;
+          activityOk = true;
+          if (tryButtonsWithTimeline) buttonsWithTimelineFailStreak = 0;
+          if (mode === 'track+mod') {
+            modButtonComboAccepted = true;
+          } else if (wantMod && modAllowedNow) {
+            modButtonComboAccepted = false;
+            modButtonBlockedUntil = Date.now() + 10 * 60 * 1000;
+            log('Вторая кнопка (мод) отклонена Discord — оставляем «Слушать трек» (повтор мода через 10 мин).');
+          }
+          break;
+        } catch (e) {
+          lastBtnErr = e;
+          if (mode === 'track+mod') {
+            modButtonComboAccepted = false;
+            log('setActivity «Слушать трек» + мод отклонены:', e.message);
+          } else {
+            log('setActivity «Слушать трек» отклонена:', e.message);
+          }
+        }
+      }
+    } else {
+      try {
+        await runSerializedRpcWrite(() => rpc.setActivity(payload));
+        activityOk = true;
+      } catch (e) {
+        lastBtnErr = e;
+      }
+    }
+
+    if (!activityOk && timestampsOk && wantButtons) {
+      // Тайм-бар важнее кнопок.
+      stripDiscordButtonsFromPayload(payload);
+      usedButtons = false;
+      usedButtonMode = 'none';
+      try {
+        await runSerializedRpcWrite(() => rpc.setActivity(payload));
+        activityOk = true;
+        buttonsWithTimelineFailStreak += 1;
+        if (wantMod) {
+          modButtonBlockedUntil = Date.now() + 10 * 60 * 1000;
+          modButtonComboAccepted = false;
+        }
+        if (buttonsWithTimelineFailStreak >= 2) {
+          buttonsWithTimelineBlockedUntil = Date.now() + 10 * 60 * 1000;
+          log('Кнопки с тайм-баром временно отключены на 10 мин (Discord отклоняет комбинацию).');
+        }
+      } catch (e2) {
+        log('setActivity только тайм-бар failed, retry без тайм-бара:', e2.message);
+        delete payload.startTimestamp;
+        delete payload.endTimestamp;
+        usedTimestamps = false;
+        // Без тайм-бара снова: трек (+ мод если включён), без замены первой кнопки.
+        applyDiscordButtonsToPayload(payload, trackUrl, wantMod ? 'track+mod' : 'track');
+        usedButtons = true;
+        usedButtonMode = wantMod ? 'track+mod' : 'track';
+        await runSerializedRpcWrite(() => rpc.setActivity(payload));
+        activityOk = true;
+      }
+    } else if (!activityOk && timestampsOk) {
+      log('setActivity с тайм-баром failed, retry without timestamps:', lastBtnErr && lastBtnErr.message);
+      delete payload.startTimestamp;
+      delete payload.endTimestamp;
+      usedTimestamps = false;
+      if (trackUrl) {
+        applyDiscordButtonsToPayload(payload, trackUrl, wantMod ? 'track+mod' : 'track');
+        usedButtons = true;
+        usedButtonMode = wantMod ? 'track+mod' : 'track';
+      }
+      await runSerializedRpcWrite(() => rpc.setActivity(payload));
+      activityOk = true;
+    } else if (!activityOk) {
+      throw lastBtnErr || new Error('setActivity failed');
+    }
+
+    if (trackUrl !== lastSentButtonUrl || usedButtonMode !== lastLoggedButtonMode) {
+      lastSentButtonUrl = trackUrl || lastSentButtonUrl;
+      lastLoggedButtonMode = usedButtonMode;
+      const modeLabel =
+        usedButtonMode === 'track+mod' ? 'Слушать трек + мод'
+          : usedButtonMode === 'track' ? 'Слушать трек'
+            : 'без кнопок';
+      log(
+        'Кнопки Discord:',
+        modeLabel,
+        usedTimestamps ? '(с тайм-баром)' : '(без тайм-бара)',
+      );
     }
     lastSentCoverKey = img.key || '';
     lastSentLargeText = img.text || '';
@@ -1512,7 +1576,7 @@ async function setActivity(track) {
       'Статус обновлён в Discord',
       `(${timePart || '—'})`,
       usedTimestamps ? '(тайм-бар)' : '(без тайм-бара)',
-      usedButtons ? '(кнопки)' : '(без кнопок)',
+      usedButtons ? `(кнопки:${usedButtonMode})` : '(без кнопок)',
       lastSentLargeText ? `coverText=${lastSentLargeText}` : '',
     );
   } catch (e) {
@@ -1538,6 +1602,7 @@ async function clearActivity(opts = {}) {
     await runSerializedRpcWrite(() => rpc.clearActivity());
     if (!silent) log('Статус сброшен.');
     lastSentButtonUrl = null;
+    lastLoggedButtonMode = null;
   } catch (e) {
     logErr('clearActivity error', e && e.message ? e.message : String(e));
     log('Ошибка clearActivity:', e.message);
@@ -2111,6 +2176,7 @@ function runHttpServer() {
         discordClientId: getActiveClientId(),
         discordClientIdSource: clientIdSource(runtimeConfig),
         discordClientIdBuiltin: BUILTIN_DISCORD_CLIENT_ID,
+        discordClientIdPresets: DISCORD_CLIENT_ID_PRESETS,
         config: publicConfigSnapshot(),
         configDir: getConfigDir(),
         nowPlaying: lastNowPlaying,

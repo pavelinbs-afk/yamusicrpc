@@ -3,7 +3,7 @@
 
 const WebSocket = require('ws');
 
-const clientIdDefault = '1475270523733807104';
+const clientIdDefault = '1551603734243704933';
 const clientId = process.env.DISCORD_RPC_CLIENT_ID || clientIdDefault;
 const port = 6463;
 const originCandidates = ['https://localhost'];

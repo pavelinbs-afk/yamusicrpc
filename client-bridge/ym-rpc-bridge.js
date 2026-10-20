@@ -506,16 +506,54 @@
     };
   }
 
+  const COVER_HD = '1000x1000';
+
+  function upgradeCoverSrc(src) {
+    if (!src || typeof src !== 'string') return '';
+    let u = src.trim();
+    if (!u) return '';
+    u = u.replace(/%%/g, COVER_HD);
+    u = u.replace(/\/\d{2,4}x\d{2,4}(?=\/|$|\?)/g, '/' + COVER_HD);
+    return u;
+  }
+
+  /** Выбрать самый крупный artwork из Media Session (не artwork[0]). */
+  function bestMediaSessionArtwork(artworkList) {
+    if (!artworkList || !artworkList.length) return '';
+    let bestSrc = '';
+    let bestArea = -1;
+    for (let i = 0; i < artworkList.length; i++) {
+      const a = artworkList[i];
+      if (!a || !a.src) continue;
+      const src = String(a.src);
+      if (!/^https?:\/\//i.test(src)) continue;
+      let area = 0;
+      const sizes = a.sizes ? String(a.sizes) : '';
+      const m = sizes.match(/(\d+)\s*[x×]\s*(\d+)/i);
+      if (m) area = Number(m[1]) * Number(m[2]);
+      else {
+        const um = src.match(/(\d{2,4})x(\d{2,4})/);
+        if (um) area = Number(um[1]) * Number(um[2]);
+        else area = 1;
+      }
+      if (area >= bestArea) {
+        bestArea = area;
+        bestSrc = src;
+      }
+    }
+    return bestSrc ? upgradeCoverSrc(bestSrc) : '';
+  }
+
   function readMediaSession() {
     try {
       const md = navigator.mediaSession && navigator.mediaSession.metadata;
       if (!md || !md.title) return null;
-      const artwork = md.artwork && md.artwork[0] && md.artwork[0].src;
+      const coverUrl = bestMediaSessionArtwork(md.artwork);
       return {
         title: String(md.title || ''),
         artist: String(md.artist || ''),
         album: String(md.album || ''),
-        coverUrl: artwork && /^https?:\/\//i.test(artwork) ? artwork : '',
+        coverUrl,
       };
     } catch (_) {
       return null;
@@ -527,7 +565,7 @@
     for (let i = 0; i < imgs.length; i++) {
       const src = imgs[i].currentSrc || imgs[i].src || '';
       if (/avatars\.yandex\.net|get-music-content|%%|cover/i.test(src)) {
-        return src.replace(/\/\d+x\d+/g, '/300x300');
+        return upgradeCoverSrc(src);
       }
     }
     return '';
@@ -553,7 +591,7 @@
     if (!uri || typeof uri !== 'string') return '';
     let u = uri.trim();
     if (!u) return '';
-    u = u.replace(/%%/g, '300x300');
+    u = upgradeCoverSrc(u);
     if (u.startsWith('//')) return 'https:' + u;
     if (/^https?:\/\//i.test(u)) return u;
     return 'https://' + u.replace(/^\/+/, '');

@@ -596,11 +596,69 @@ function isAllowedCoverUrl(u) {
       host.endsWith('yandex.com') ||
       host.endsWith('yandex.by') ||
       host.endsWith('yandex.kz') ||
-      host.endsWith('dzcdn.net')       // Deezer CDN
+      host.endsWith('dzcdn.net') ||       // Deezer CDN
+      host.endsWith('mzstatic.com')       // Apple / iTunes artwork
     );
   } catch (_) {
     return false;
   }
+}
+
+/** Целевой размер обложки для Discord (CDN Яндекса / Deezer / iTunes). */
+const COVER_HD_SIZE = '1000x1000';
+
+/**
+ * Поднять размер в CDN-URL (%% / NxN / cover_big → HD).
+ * Discord тянет external HTTPS as-is — мелкий 300×300 выглядит мыльно.
+ */
+function upgradeCoverUrl(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  let u = raw.trim();
+  if (!u) return '';
+  if (u.startsWith('//')) u = 'https:' + u;
+  else if (!/^https?:\/\//i.test(u)) u = 'https://' + u.replace(/^\/+/, '');
+
+  // Яндекс: плейсхолдер %% или явный размер в пути
+  u = u.replace(/%%/g, COVER_HD_SIZE);
+  u = u.replace(/\/\d{2,4}x\d{2,4}(?=\/|$|\?)/g, '/' + COVER_HD_SIZE);
+
+  // Deezer: cover_small/medium/big → cover_xl (~1000)
+  u = u.replace(/\/cover_(?:small|medium|big)\b/gi, '/cover_xl');
+  // Deezer иногда: .../500x500-000000-80-0-0.jpg
+  u = u.replace(/\/\d{2,4}x\d{2,4}(?=-)/g, '/' + COVER_HD_SIZE);
+
+  // iTunes / Apple Music: artworkUrl100 → 1000x1000 (или крупнее в том же шаблоне)
+  u = u.replace(/\/\d+x\d+bb(?:-\d+)?(\.[a-z]+)$/i, '/' + COVER_HD_SIZE + 'bb$1');
+  u = u.replace(/\/\d+x\d+(\.[a-z]+)$/i, '/' + COVER_HD_SIZE + '$1');
+
+  return u;
+}
+
+/** Оценка «крупности» по размеру в URL (для выбора лучшего источника). */
+function coverUrlSizeScore(u) {
+  if (!u || typeof u !== 'string') return 0;
+  if (/cover_xl/i.test(u)) return 1000;
+  if (/cover_big/i.test(u)) return 500;
+  if (/cover_medium/i.test(u)) return 250;
+  if (/cover_small/i.test(u)) return 56;
+  const m = u.match(/(\d{2,4})x(\d{2,4})/);
+  if (m) return Math.min(Number(m[1]), Number(m[2]));
+  if (/%%/.test(u)) return 0;
+  return 400; // неизвестный HTTPS — средний приоритет
+}
+
+function isLowResCoverUrl(u) {
+  const score = coverUrlSizeScore(u);
+  return score > 0 && score < 600;
+}
+
+/** Выбрать более крупную обложку из двух URL. */
+function preferSharperCover(a, b) {
+  const ua = a ? upgradeCoverUrl(a) : '';
+  const ub = b ? upgradeCoverUrl(b) : '';
+  if (!ua) return ub || '';
+  if (!ub) return ua;
+  return coverUrlSizeScore(ub) > coverUrlSizeScore(ua) ? ub : ua;
 }
 
 /** Хранилище сессионных кук для Яндекс.Музыки (один сессионный jar на все запросы) */
@@ -712,10 +770,21 @@ const COVER_CACHE_NULL_TTL_MS = 30 * 1000; // null — 30 сек (ретрай �
 /** Дедупликация одновременных запросов обложек: key → Promise */
 const pendingCoverFetches = new Map();
 
-/** Установить URL в кеш (без перезаписи валидного url на null) */
+/** Установить URL в кеш (без перезаписи валидного url на null); всегда HD-апгрейд. */
 function coverCacheSetSafe(cacheKey, url, ts) {
   if (url) {
-    coverCache.set(cacheKey, { url, ts });
+    const hd = upgradeCoverUrl(url);
+    if (!hd || !isAllowedCoverUrl(hd)) {
+      coverCache.set(cacheKey, { url: null, ts });
+      return;
+    }
+    const existing = coverCache.get(cacheKey);
+    if (existing && existing.url && Date.now() - existing.ts < COVER_CACHE_TTL_MS) {
+      const better = preferSharperCover(existing.url, hd);
+      coverCache.set(cacheKey, { url: better, ts });
+      return;
+    }
+    coverCache.set(cacheKey, { url: hd, ts });
     return;
   }
   // Не перезаписываем валидный кеш null'ом
@@ -850,7 +919,7 @@ function finishParse(raw, resolve, cacheKey) {
         uri = findCoverUriInJson(j, 8);
       }
       if (uri) {
-        const coverUrl = `https://${uri.replace(/^\/+/, '')}`;
+        const coverUrl = upgradeCoverUrl(`https://${uri.replace(/^\/+/, '')}`);
         log('DEBUG cover FOUND:', { cacheKey, coverUrl });
         coverCacheSetSafe(cacheKey, coverUrl, Date.now());
         return resolve(coverUrl);
@@ -864,11 +933,7 @@ function finishParse(raw, resolve, cacheKey) {
       || raw.match(/<meta\s+[^>]*property\s*=\s*["']og:image["'][^>]*content\s*=\s*["']([^"']+)["'][^>]*\/?>/i)
       || raw.match(/<meta\s+[^>]*content\s*=\s*["']([^"']+)["'][^>]*property\s*=\s*["']og:image["'][^>]*\/?>/i);
     if (htmlCoverMatch && htmlCoverMatch[1]) {
-      let coverUrl = htmlCoverMatch[1].trim();
-      if (coverUrl.startsWith('//')) coverUrl = 'https:' + coverUrl;
-      else if (!/^https?:\/\//i.test(coverUrl)) coverUrl = 'https://' + coverUrl.replace(/^\/+/, '');
-      // Заменяем размер на 600x600 для единообразия
-      coverUrl = coverUrl.replace(/\/\d+x\d+(?=\/|$)/, '/600x600');
+      let coverUrl = upgradeCoverUrl(htmlCoverMatch[1].trim());
       if (isAllowedCoverUrl(coverUrl)) {
         log('DEBUG cover from HTML fallback:', { cacheKey, coverUrl });
         coverCacheSetSafe(cacheKey, coverUrl, Date.now());
@@ -886,8 +951,8 @@ function finishParse(raw, resolve, cacheKey) {
 }
 
 /**
- * Ищет обложку трека: Яндекс.Музыка и Deezer — одновременно (параллельно).
- * Яндекс — приоритетный источник; если он медленный / капча / ошибка — Deezer.
+ * Ищет обложку трека: Яндекс + Deezer XL + iTunes HD (параллельно).
+ * Яндекс — приоритет по совпадению; при мелком URL или таймауте — более крупный внешний.
  * Возвращает HTTPS-URL или null.
  */
 function fetchCoverFromYandexApi(title, artist, album) {
@@ -898,7 +963,9 @@ function fetchCoverFromYandexApi(title, artist, album) {
   if (cached) {
     const ttl = cached.url ? COVER_CACHE_TTL_MS : COVER_CACHE_NULL_TTL_MS;
     if (Date.now() - cached.ts < ttl) {
-      return Promise.resolve(cached.url);
+      const hd = cached.url ? upgradeCoverUrl(cached.url) : null;
+      if (hd && !isLowResCoverUrl(hd)) return Promise.resolve(hd);
+      // Мелкий кэш — не отдаём сразу, добираем HD ниже
     }
   }
 
@@ -914,12 +981,10 @@ function fetchCoverFromYandexApi(title, artist, album) {
   }
 
   const promise = (async () => {
-    // Запускаем Яндекс и Deezer параллельно
     const yandexPromise = fetchCoverWithRetries(q, cacheKey, Date.now() + 20000);
     const deezerPromise = fetchCoverFromDeezerApi(title, artist, cacheKey);
+    const itunesPromise = fetchCoverFromItunesApi(title, artist, cacheKey);
 
-    // Приоритет: Яндекс → Deezer.
-    // Даём Яндексу фору (8 сек — хватит на 1-2 ретрая при капче).
     const YANDEX_PRIORITY_TIMEOUT_MS = 8000;
 
     const yandexWithTimeout = Promise.race([
@@ -931,36 +996,47 @@ function fetchCoverFromYandexApi(title, artist, album) {
     ]);
 
     const yandexResult = await yandexWithTimeout;
+    const pickExternal = async () => {
+      const [d, i] = await Promise.all([deezerPromise, itunesPromise]);
+      return preferSharperCover(d, i) || d || i || null;
+    };
 
     if (yandexResult === '__timeout__') {
-      // Яндекс не ответил за отведённое время (капча/медленный) — берём Deezer
-      const deezerResult = await deezerPromise;
-      if (deezerResult) {
-        log('DEBUG cover: Yandex too slow, using Deezer for', cacheKey);
-        // Яндекс продолжает искаться в фоне — если найдёт, обновим кеш для следующих запросов
+      const external = await pickExternal();
+      if (external) {
+        log('DEBUG cover: Yandex too slow, using external HD for', cacheKey);
         yandexPromise.then((url) => {
           if (url) {
+            const best = preferSharperCover(url, external);
             log('DEBUG cover: Yandex found later, updating cache for', cacheKey);
-            coverCacheSetSafe(cacheKey, url, Date.now());
+            coverCacheSetSafe(cacheKey, best, Date.now());
           }
         }).catch(() => {});
-        return deezerResult;
+        coverCacheSetSafe(cacheKey, external, Date.now());
+        return upgradeCoverUrl(external);
       }
-      // Deezer тоже не дал результат — ждём Яндекс до конца
-      log('DEBUG cover: both slow, waiting for Yandex to finish for', cacheKey);
+      log('DEBUG cover: all slow, waiting for Yandex to finish for', cacheKey);
       const yandexLate = await yandexPromise;
-      return yandexLate; // url или null
+      return yandexLate ? upgradeCoverUrl(yandexLate) : null;
     }
 
     if (yandexResult) {
-      // Яндекс нашёл обложку — лучший результат
-      return yandexResult;
+      const ya = upgradeCoverUrl(yandexResult);
+      if (!isLowResCoverUrl(ya)) {
+        coverCacheSetSafe(cacheKey, ya, Date.now());
+        return ya;
+      }
+      // Яндекс дал мелкий URL — добираем HD снаружи
+      const external = await pickExternal();
+      const best = preferSharperCover(ya, external);
+      coverCacheSetSafe(cacheKey, best, Date.now());
+      return best || ya;
     }
 
-    // Яндекс вернул null (не нашёл) — пробуем Deezer
-    log('DEBUG cover: Yandex returned null, trying Deezer for', cacheKey);
-    const deezerResult = await deezerPromise;
-    return deezerResult;
+    log('DEBUG cover: Yandex returned null, trying Deezer/iTunes for', cacheKey);
+    const external = await pickExternal();
+    if (external) coverCacheSetSafe(cacheKey, external, Date.now());
+    return external ? upgradeCoverUrl(external) : null;
   })().finally(() => {
     pendingCoverFetches.delete(cacheKey);
   });
@@ -1016,7 +1092,7 @@ function fetchAlbumTitleFromDeezer(title, artist) {
   });
 }
 
-/** Фолбек: поиск обложки через публичное API Deezer */
+/** Фолбек: поиск обложки через публичное API Deezer (cover_xl ~1000px). */
 function fetchCoverFromDeezerApi(title, artist, cacheKey) {
   const q = encodeURIComponent(`${title} ${artist}`.trim());
   const url = `https://api.deezer.com/search?q=${q}&limit=1`;
@@ -1036,7 +1112,6 @@ function fetchCoverFromDeezerApi(title, artist, cacheKey) {
       res.on('end', () => {
         if (res.statusCode !== 200) {
           log('DEBUG deezer API status:', res.statusCode);
-          coverCacheSetSafe(cacheKey, null, Date.now());
           finish(null);
           return;
         }
@@ -1047,32 +1122,86 @@ function fetchCoverFromDeezerApi(title, artist, cacheKey) {
             const ak = [title, artist].filter(Boolean).join(' ').trim().toLowerCase();
             if (ak) albumNameCache.set(ak, { album: String(track.album.title).trim(), ts: Date.now() });
           }
-          const coverUrl = track && track.album && track.album.cover_big;
-          if (coverUrl && /^https?:\/\//i.test(coverUrl)) {
+          const album = track && track.album;
+          const raw =
+            (album && (album.cover_xl || album.cover_big || album.cover_medium)) || '';
+          const coverUrl = raw ? upgradeCoverUrl(raw) : '';
+          if (coverUrl && isAllowedCoverUrl(coverUrl)) {
             log('DEBUG cover from Deezer:', { cacheKey, coverUrl });
             coverCacheSetSafe(cacheKey, coverUrl, Date.now());
             finish(coverUrl);
           } else {
             log('DEBUG deezer: no cover in response for', cacheKey);
-            coverCacheSetSafe(cacheKey, null, Date.now());
             finish(null);
           }
         } catch (_) {
           log('DEBUG deezer parse error for', cacheKey);
-          coverCacheSetSafe(cacheKey, null, Date.now());
           finish(null);
         }
       });
     });
     req.on('error', (e) => {
       log('DEBUG deezer API error:', e.message);
-      coverCacheSetSafe(cacheKey, null, Date.now());
       finish(null);
     });
     req.setTimeout(5000, () => {
       req.destroy();
       log('DEBUG deezer API timeout for', cacheKey);
-      coverCacheSetSafe(cacheKey, null, Date.now());
+      finish(null);
+    });
+  });
+}
+
+/** Фолбек HD: iTunes Search API (artworkUrl100 → 1000x1000). */
+function fetchCoverFromItunesApi(title, artist, cacheKey) {
+  const term = encodeURIComponent(`${title} ${artist}`.trim());
+  if (!term) return Promise.resolve(null);
+  const url = `https://itunes.apple.com/search?term=${term}&media=music&entity=song&limit=1`;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      resolve(val);
+    };
+    const req = https.get(url, {
+      headers: { 'User-Agent': 'YandexMusicRPC/2.0' },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          log('DEBUG itunes API status:', res.statusCode);
+          finish(null);
+          return;
+        }
+        try {
+          const j = JSON.parse(data);
+          const track = j.results && j.results[0];
+          const raw = track && (track.artworkUrl100 || track.artworkUrl60);
+          const coverUrl = raw ? upgradeCoverUrl(raw) : '';
+          if (coverUrl && isAllowedCoverUrl(coverUrl)) {
+            log('DEBUG cover from iTunes:', { cacheKey, coverUrl });
+            coverCacheSetSafe(cacheKey, coverUrl, Date.now());
+            finish(coverUrl);
+          } else {
+            log('DEBUG itunes: no cover in response for', cacheKey);
+            finish(null);
+          }
+        } catch (_) {
+          log('DEBUG itunes parse error for', cacheKey);
+          finish(null);
+        }
+      });
+    });
+    req.on('error', (e) => {
+      log('DEBUG itunes API error:', e.message);
+      finish(null);
+    });
+    req.setTimeout(5000, () => {
+      req.destroy();
+      log('DEBUG itunes API timeout for', cacheKey);
       finish(null);
     });
   });
@@ -1121,8 +1250,7 @@ function fetchCoverWithRetries(q, cacheKey, deadline, attemptNum) {
           } else {
             coverUrl = m[0].replace(/[,;]+$/, '');
           }
-          if (!/^https?:\/\//i.test(coverUrl)) coverUrl = 'https://' + coverUrl.replace(/^\/+/, '');
-          coverUrl = coverUrl.replace(/\/\d+x\d+(?=\/|$)/, '/600x600');
+          coverUrl = upgradeCoverUrl(coverUrl);
           if (isAllowedCoverUrl(coverUrl)) {
             log('DEBUG cover from search page:', { cacheKey, coverUrl });
             coverCacheSetSafe(cacheKey, coverUrl, Date.now());
@@ -1224,7 +1352,8 @@ function discordCoverCaption(track) {
 }
 
 function pickLargeImage(track) {
-  const cover = track && track.coverUrl;
+  const coverRaw = track && track.coverUrl;
+  const cover = coverRaw ? upgradeCoverUrl(coverRaw) : '';
   const caption = discordCoverCaption(track || {});
   if (runtimeConfig.coverArtEnabled && cover && isAllowedCoverUrl(cover)) {
     return { key: cover.slice(0, 512), text: caption };
@@ -2382,14 +2511,36 @@ function runHttpServer() {
           }
           let album = typeof msg.album === 'string' ? msg.album.trim() : '';
           let coverUrl = typeof msg.coverUrl === 'string' ? msg.coverUrl.trim() : '';
-          if (coverUrl && !isAllowedCoverUrl(coverUrl)) coverUrl = '';
+          if (coverUrl) {
+            coverUrl = upgradeCoverUrl(coverUrl);
+            if (!isAllowedCoverUrl(coverUrl)) coverUrl = '';
+          }
+          // Мост прислал мелкий CDN (старый 300×300) — добираем HD с Deezer/iTunes в фоне.
+          if (coverUrl && isLowResCoverUrl(coverUrl) && title) {
+            const cacheKey = [title, artist, album].filter(Boolean).join(' ').toLowerCase();
+            const pendingHd = fetchCoverFromYandexApi(title, artist, album);
+            const quick = (await Promise.race([
+              pendingHd,
+              new Promise((r) => setTimeout(() => r(null), 900)),
+            ])) || '';
+            if (quick) coverUrl = preferSharperCover(coverUrl, quick);
+            else {
+              pendingHd.then((hd) => {
+                if (!hd) return;
+                const sharper = preferSharperCover(coverUrl, hd);
+                if (sharper && sharper !== coverUrl) {
+                  coverCacheSetSafe(cacheKey, sharper, Date.now());
+                }
+              }).catch(() => {});
+            }
+          }
           // Для десктопа без готового URL — ищем обложку (title+artist+album).
           // coverPath из GSMTC — локальный файл; Discord принимает только HTTPS, поэтому API.
           if (!coverUrl && title && (src === 'desktop' || src === 'client')) {
             const cacheKey = [title, artist, album].filter(Boolean).join(' ').toLowerCase();
             const cached = coverCache.get(cacheKey);
-            if (cached && cached.url && Date.now() - cached.ts < COVER_CACHE_TTL_MS) {
-              coverUrl = cached.url;
+            if (cached && cached.url && Date.now() - cached.ts < COVER_CACHE_TTL_MS && !isLowResCoverUrl(cached.url)) {
+              coverUrl = upgradeCoverUrl(cached.url);
             } else {
               // Ждём дольше: иначе Discord успевает получить activity без обложки
               // (иконка приложения), а поздний cover не пробивает троттлинг.
@@ -2401,11 +2552,12 @@ function runHttpServer() {
               if (!coverUrl) {
                 const late = coverCache.get(cacheKey);
                 if (late && late.url && Date.now() - late.ts < COVER_CACHE_TTL_MS) {
-                  coverUrl = late.url;
+                  coverUrl = upgradeCoverUrl(late.url);
                 }
               }
             }
           }
+          if (coverUrl) coverUrl = upgradeCoverUrl(coverUrl);
           // 3-я строка Discord = альбом — если мост не дал album, добираем из Deezer.
           if (!album && title && artist) {
             const fromCache = albumNameCache.get([title, artist].join(' ').trim().toLowerCase());

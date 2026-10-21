@@ -556,15 +556,28 @@ function runSerializedRpcWrite(task) {
   return next;
 }
 
+/**
+ * discord-rpc destroy() → Promise; при «Could not connect» socket=null и
+ * IPCTransport.close падает на write → unhandledRejection. try/catch это не ловит.
+ */
+function safeDestroyRpc(client) {
+  if (!client) return Promise.resolve();
+  try {
+    const p = client.destroy();
+    if (p && typeof p.then === 'function') {
+      return Promise.resolve(p).catch(() => {});
+    }
+  } catch (_) {}
+  return Promise.resolve();
+}
+
 function forceRpcReconnectFromTimeout() {
   if (rpcTimeoutRecoveryInProgress || rpcShutdownStarted) return;
   rpcTimeoutRecoveryInProgress = true;
   try {
     const oldRpc = rpc;
     rpc = null;
-    if (oldRpc) {
-      try { oldRpc.destroy(); } catch (_) {}
-    }
+    safeDestroyRpc(oldRpc);
     // Если предыдущий write завис, очередь уже сломана — начинаем чистую цепочку.
     rpcWriteChain = Promise.resolve();
     startDiscordReconnectLoop();
@@ -1765,7 +1778,7 @@ function initDiscordRpc(timeoutMs = 20000) {
     const timer = setTimeout(() => {
       if (finished) return;
       finished = true;
-      try { client.destroy(); } catch (_) {}
+      safeDestroyRpc(client);
       rpc = null;
       reject(new Error(`Discord RPC ready timeout after ${timeoutMs}ms`));
     }, timeoutMs);
@@ -1798,10 +1811,11 @@ function initDiscordRpc(timeoutMs = 20000) {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
-        try { client.destroy(); } catch (_) {}
-        rpc = null;
-        log('Не удалось подключиться к Discord. Убедись, что Discord запущен и Application ID верный.');
-        reject(err);
+        safeDestroyRpc(client).finally(() => {
+          rpc = null;
+          log('Не удалось подключиться к Discord. Убедись, что Discord запущен и Application ID верный.');
+          reject(err);
+        });
       });
   });
 }
@@ -1812,8 +1826,9 @@ async function reconnectDiscordWithNewClientId() {
   try {
     if (rpc) {
       try { await clearActivity({ silent: true }); } catch (_) {}
-      try { rpc.destroy(); } catch (_) {}
+      const old = rpc;
       rpc = null;
+      await safeDestroyRpc(old);
     }
   } catch (_) {}
   startDiscordReconnectLoop();
@@ -2283,8 +2298,11 @@ function runHttpServer() {
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
         setTimeout(() => {
-          try { if (rpc) rpc.destroy(); } catch {}
-          try { process.exit(0); } catch {}
+          const old = rpc;
+          rpc = null;
+          safeDestroyRpc(old).finally(() => {
+            try { process.exit(0); } catch {}
+          });
         }, 80);
       })();
       return;
@@ -2455,8 +2473,11 @@ function runHttpServer() {
             log('HTTP shutdown received. Exiting process.');
             // Минимизируем задержку, чтобы порт 8765 точно освободился
             setTimeout(() => {
-              try { if (rpc) rpc.destroy(); } catch {}
-              try { process.exit(0); } catch {}
+              const old = rpc;
+              rpc = null;
+              safeDestroyRpc(old).finally(() => {
+                try { process.exit(0); } catch {}
+              });
             }, 100);
           }
           return;
@@ -3114,7 +3135,9 @@ async function gracefulShutdown(reason, opts = {}) {
   try {
     if (rpc) {
       await clearActivity();
-      rpc.destroy();
+      const old = rpc;
+      rpc = null;
+      await safeDestroyRpc(old);
     }
   } catch (e) {
     log('Ошибка при сбросе статуса:', e.message);

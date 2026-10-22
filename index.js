@@ -122,6 +122,11 @@ let idleTimer = null;
 let pausedClearTimer = null;
 /** Последовательная очередь записей в Discord RPC (защита от гонок set/clear при частых POST). */
 let rpcWriteChain = Promise.resolve();
+/**
+ * Поколение IPC: при обрыве Discord / timeout bump → старые write в очереди no-op,
+ * иначе clearActivity зависает 15с и спамит reconnect после Alt+F4 Discord.
+ */
+let rpcWriteGeneration = 0;
 let currentTrackKey = null;
 let currentTrackStart = null;
 let currentTrackDurationSec = null; // фиксируем длительность трека один раз при старте
@@ -528,15 +533,50 @@ function formatTime(sec) {
   return `${m}:${rs.toString().padStart(2, '0')}`;
 }
 
+function presenceAlreadyClearedLocally() {
+  return (
+    !lastSentTrackKey ||
+    lastSentTrackKey === '__cleared__' ||
+    lastSentTrackKey === '__cleared_pause__' ||
+    lastSentTrackKey === '__paused__'
+  );
+}
+
+let rpcInvalidating = false;
+
+/** Обрыв IPC: инвалидируем очередь и client, чтобы поллер не долбил clearActivity. */
+function invalidateRpcTransport(reason) {
+  if (rpcInvalidating) return;
+  rpcInvalidating = true;
+  try {
+    rpcWriteGeneration += 1;
+    const oldRpc = rpc;
+    rpc = null;
+    rpcWriteChain = Promise.resolve();
+    if (reason) log('Discord IPC сброшен:', reason);
+    safeDestroyRpc(oldRpc);
+  } finally {
+    rpcInvalidating = false;
+  }
+}
+
 function runSerializedRpcWrite(task) {
+  const gen = rpcWriteGeneration;
   const gated = async () => {
+    if (!rpc || gen !== rpcWriteGeneration) return undefined;
     let timer;
     const timeout = new Promise((_, rej) => {
       timer = setTimeout(() => rej(new Error('RPC_WRITE_TIMEOUT')), RPC_WRITE_TIMEOUT_MS);
       if (timer.unref) timer.unref();
     });
     try {
-      return await Promise.race([Promise.resolve().then(task), timeout]);
+      return await Promise.race([
+        Promise.resolve().then(() => {
+          if (!rpc || gen !== rpcWriteGeneration) return undefined;
+          return task();
+        }),
+        timeout,
+      ]);
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -544,6 +584,8 @@ function runSerializedRpcWrite(task) {
   const next = rpcWriteChain.then(gated, gated);
   rpcWriteChain = next.catch((e) => {
     if (e && e.message === 'RPC_WRITE_TIMEOUT') {
+      // Устаревшее поколение — Discord уже переподключаем, не долбим ещё раз.
+      if (gen !== rpcWriteGeneration) return undefined;
       logErr(
         'Discord RPC: таймаут записи',
         RPC_WRITE_TIMEOUT_MS,
@@ -575,11 +617,7 @@ function forceRpcReconnectFromTimeout() {
   if (rpcTimeoutRecoveryInProgress || rpcShutdownStarted) return;
   rpcTimeoutRecoveryInProgress = true;
   try {
-    const oldRpc = rpc;
-    rpc = null;
-    safeDestroyRpc(oldRpc);
-    // Если предыдущий write завис, очередь уже сломана — начинаем чистую цепочку.
-    rpcWriteChain = Promise.resolve();
+    invalidateRpcTransport('write timeout');
     startDiscordReconnectLoop();
   } finally {
     setTimeout(() => { rpcTimeoutRecoveryInProgress = false; }, 2500);
@@ -1523,6 +1561,7 @@ function resolveDiscordListeningTimestamps(track, elapsedSec, totalSec, nowMs, o
 async function setActivity(track) {
   if (!rpc || !runtimeConfig.rpcEnabled) return;
   desiredPresence = { kind: 'playing', track: { ...track } };
+  // На случай если RPC умрёт mid-flight — runSerializedRpcWrite сам no-op.
   const { title = '', artist = '', url: trackUrl, positionSec, durationSec } = track;
 
   const p = typeof positionSec === 'number' && Number.isFinite(positionSec) ? Math.max(0, positionSec) : 0;
@@ -1738,16 +1777,38 @@ async function setPausedActivity(_track) {
 async function clearActivity(opts = {}) {
   desiredPresence = { kind: 'clear', track: null };
   lastSentHadTimestamps = false;
-  if (!rpc) return;
   const silent = opts && opts.silent === true;
+  const force = opts && opts.force === true;
+  // Локально уже сброшено — не спамим Discord IPC и логи (поллер ~0.5с).
+  if (!force && presenceAlreadyClearedLocally()) {
+    lastSentButtonUrl = null;
+    lastLoggedButtonMode = null;
+    return;
+  }
+  if (!rpc) {
+    lastSentTrackKey = '__cleared__';
+    lastSentButtonUrl = null;
+    lastLoggedButtonMode = null;
+    return;
+  }
   try {
-    await runSerializedRpcWrite(() => rpc.clearActivity());
+    await runSerializedRpcWrite(() => {
+      if (!rpc || typeof rpc.clearActivity !== 'function') return undefined;
+      return rpc.clearActivity();
+    });
+    lastSentTrackKey = '__cleared__';
     if (!silent) log('Статус сброшен.');
     lastSentButtonUrl = null;
     lastLoggedButtonMode = null;
   } catch (e) {
-    logErr('clearActivity error', e && e.message ? e.message : String(e));
-    log('Ошибка clearActivity:', e.message);
+    const msg = e && e.message ? e.message : String(e);
+    // Обрыв Discord / реконнект — не засоряем лог.
+    if (/RPC_WRITE_TIMEOUT|connection closed|Could not connect|null/i.test(msg)) {
+      lastSentTrackKey = '__cleared__';
+      return;
+    }
+    logErr('clearActivity error', msg);
+    log('Ошибка clearActivity:', msg);
   }
 }
 
@@ -1768,7 +1829,9 @@ async function restoreDesiredPresenceAfterReconnect() {
 
 function initDiscordRpc(timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
-    // reset rpc reference for each attempt
+    // Новая попытка: гасим хвост старой очереди (после kill Discord).
+    rpcWriteGeneration += 1;
+    rpcWriteChain = Promise.resolve();
     rpc = null;
 
     const client = new Client({ transport: 'ipc' });
@@ -1797,8 +1860,11 @@ function initDiscordRpc(timeoutMs = 20000) {
     client.on('ready', () => finishResolve('Discord RPC ready event received.'));
 
     client.on('disconnected', () => {
-      // When Discord closes, we should re-connect later.
+      // Резкое закрытие Discord (обновление / Alt+F4): сразу гасим очередь write.
       log('Discord RPC отключён.');
+      if (rpc === client || rpc == null) {
+        invalidateRpcTransport('disconnected');
+      }
       startDiscordReconnectLoop();
     });
 
@@ -1826,11 +1892,9 @@ async function reconnectDiscordWithNewClientId() {
   try {
     if (rpc) {
       try { await clearActivity({ silent: true }); } catch (_) {}
-      const old = rpc;
-      rpc = null;
-      await safeDestroyRpc(old);
     }
   } catch (_) {}
+  invalidateRpcTransport('client id changed');
   startDiscordReconnectLoop();
 }
 

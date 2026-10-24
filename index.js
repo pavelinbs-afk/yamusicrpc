@@ -147,12 +147,13 @@ let clockOffsetMs = 0;
 /** Какой presence должен быть активен после реконнекта Discord RPC. */
 let desiredPresence = { kind: 'clear', track: null };
 let rpcTimeoutRecoveryInProgress = false;
-/** Для таймстампов Rich Presence: сбой worldtimeapi не должен уводить start/end на часы. */
+/**
+ * Поправка часов для Rich Presence.
+ * |offset| > 10с почти всегда сбой worldtimeapi (иначе тайм-бар уезжает на десятки секунд).
+ */
 function clampedDiscordClockOffsetMs() {
   if (!Number.isFinite(clockOffsetMs)) return 0;
-  const lim = 120000;
-  if (clockOffsetMs > lim) return lim;
-  if (clockOffsetMs < -lim) return -lim;
+  if (Math.abs(clockOffsetMs) > 10000) return 0;
   return clockOffsetMs;
 }
 let suppressUntilMs = 0;
@@ -560,23 +561,29 @@ function invalidateRpcTransport(reason) {
   }
 }
 
+/**
+ * @returns {Promise<{ skipped: boolean, result?: * }>}
+ */
 function runSerializedRpcWrite(task) {
   const gen = rpcWriteGeneration;
   const gated = async () => {
-    if (!rpc || gen !== rpcWriteGeneration) return undefined;
+    if (!rpc || gen !== rpcWriteGeneration) return { skipped: true };
     let timer;
     const timeout = new Promise((_, rej) => {
       timer = setTimeout(() => rej(new Error('RPC_WRITE_TIMEOUT')), RPC_WRITE_TIMEOUT_MS);
       if (timer.unref) timer.unref();
     });
     try {
-      return await Promise.race([
+      const result = await Promise.race([
         Promise.resolve().then(() => {
-          if (!rpc || gen !== rpcWriteGeneration) return undefined;
+          if (!rpc || gen !== rpcWriteGeneration) return { __skipped: true };
           return task();
         }),
         timeout,
       ]);
+      if (result && result.__skipped) return { skipped: true };
+      if (!rpc || gen !== rpcWriteGeneration) return { skipped: true };
+      return { skipped: false, result };
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -585,7 +592,7 @@ function runSerializedRpcWrite(task) {
   rpcWriteChain = next.catch((e) => {
     if (e && e.message === 'RPC_WRITE_TIMEOUT') {
       // Устаревшее поколение — Discord уже переподключаем, не долбим ещё раз.
-      if (gen !== rpcWriteGeneration) return undefined;
+      if (gen !== rpcWriteGeneration) return { skipped: true };
       logErr(
         'Discord RPC: таймаут записи',
         RPC_WRITE_TIMEOUT_MS,
@@ -593,9 +600,14 @@ function runSerializedRpcWrite(task) {
       );
       forceRpcReconnectFromTimeout();
     }
-    return undefined;
+    return { skipped: true };
   });
   return next;
+}
+
+/** true, если write реально ушёл в Discord (не no-op из‑за реконнекта). */
+function rpcWriteDidSend(out) {
+  return Boolean(out && out.skipped === false);
 }
 
 /**
@@ -1558,10 +1570,49 @@ function resolveDiscordListeningTimestamps(track, elapsedSec, totalSec, nowMs, o
   return computeDiscordListeningTimestamps(elapsedSec, totalSec, nowMs, offsetMs);
 }
 
+/**
+ * Таймстампы считаем в момент реальной отправки в Discord.
+ * Если считать раньше и write зависнет в очереди — Discord покажет «уже +N сек».
+ * @returns {{ timestampsOk: boolean }}
+ */
+function applyFreshListeningTimestamps(payload, track, elapsedSec, totalSec) {
+  const now = Date.now();
+  const off = clampedDiscordClockOffsetMs();
+  const { startAdjusted, endAdjusted } = resolveDiscordListeningTimestamps(
+    track,
+    elapsedSec,
+    totalSec,
+    now,
+    off,
+  );
+  const hasValidEnd = startAdjusted != null && endAdjusted != null;
+  let startMs = hasValidEnd ? toDiscordRpcUnixMs(startAdjusted) : undefined;
+  let endMs = hasValidEnd ? toDiscordRpcUnixMs(endAdjusted) : undefined;
+  if (typeof endMs === 'number' && endMs <= now + 1500) {
+    const remain = Math.max((totalSec - elapsedSec) * 1000, 2000);
+    endMs = now + remain;
+  }
+  const timestampsOk =
+    typeof startMs === 'number' &&
+    typeof endMs === 'number' &&
+    endMs > startMs + 1500 &&
+    endMs > now + 1000;
+  if (timestampsOk) {
+    payload.startTimestamp = startMs;
+    payload.endTimestamp = endMs;
+  } else {
+    delete payload.startTimestamp;
+    delete payload.endTimestamp;
+  }
+  return { timestampsOk };
+}
+
+/**
+ * @returns {Promise<boolean>} true — activity реально ушёл в Discord
+ */
 async function setActivity(track) {
-  if (!rpc || !runtimeConfig.rpcEnabled) return;
+  if (!rpc || !runtimeConfig.rpcEnabled) return false;
   desiredPresence = { kind: 'playing', track: { ...track } };
-  // На случай если RPC умрёт mid-flight — runSerializedRpcWrite сам no-op.
   const { title = '', artist = '', url: trackUrl, positionSec, durationSec } = track;
 
   const p = typeof positionSec === 'number' && Number.isFinite(positionSec) ? Math.max(0, positionSec) : 0;
@@ -1572,64 +1623,32 @@ async function setActivity(track) {
   const posStr = formatTime(elapsedSec);
   const durStr = totalSec > 0 ? formatTime(totalSec) : null;
   const timePart = posStr && durStr ? `${posStr}/${durStr}` : posStr || '';
-  // Listening: 1) details = трек, 2) state = артист, 3) largeImageText = альбом
   const details = discordClampText(title || 'Яндекс.Музыка', 128);
   const artistLine = (artist || '').trim();
   const state = artistLine ? discordClampText(artistLine, 128) : undefined;
   const img = pickLargeImage(track);
   try {
-    const now = Date.now();
-    const off = clampedDiscordClockOffsetMs();
-    const { startAdjusted, endAdjusted } = resolveDiscordListeningTimestamps(
-      track,
-      elapsedSec,
-      totalSec,
-      now,
-      off,
-    );
-    const hasValidEnd = startAdjusted != null && endAdjusted != null;
-    const startMs = hasValidEnd ? toDiscordRpcUnixMs(startAdjusted) : undefined;
-    let endMs = hasValidEnd ? toDiscordRpcUnixMs(endAdjusted) : undefined;
-    const nowMsRpc = Date.now();
-    // Просроченный end → Discord мгновенно убирает activity у всех.
-    if (typeof endMs === 'number' && endMs <= nowMsRpc + 1500) {
-      const remain = Math.max((totalSec - elapsedSec) * 1000, 2000);
-      endMs = nowMsRpc + remain;
-    }
-    const timestampsOk =
-      typeof startMs === 'number' &&
-      typeof endMs === 'number' &&
-      endMs > startMs + 1500 &&
-      endMs > nowMsRpc + 1000;
+    // Предварительная оценка таймстампов — только для выбора кнопок (с тайм-баром или нет).
+    const preview = applyFreshListeningTimestamps({}, track, elapsedSec, totalSec);
+    const timestampsOkPreview = preview.timestampsOk;
+
     const payload = {
       details,
       state,
-      // Listening (type=2) — чаще всего показывает тайм‑бар/прогресс,
-      // в отличие от "Playing" (type=0), который может показывать countdown.
       type: 2,
-      startTimestamp: timestampsOk ? startMs : undefined,
-      endTimestamp: timestampsOk ? endMs : undefined,
     };
     if (img.key) {
       payload.largeImageKey = img.key;
       payload.largeImageText = discordAssetText(img.text);
     }
-    if (!timestampsOk) {
-      log('DEBUG skip timestamps:', {
-        hasValidEnd,
-        startMs,
-        endMs,
-        nowMs: nowMsRpc,
-      });
-    }
 
     const tryButtonsWithTimeline =
       Boolean(trackUrl) &&
-      timestampsOk &&
+      timestampsOkPreview &&
       runtimeConfig.discordTryButtonsWithTimeline !== false &&
       Date.now() >= buttonsWithTimelineBlockedUntil;
     const wantButtons = Boolean(trackUrl) && (
-      !timestampsOk || tryButtonsWithTimeline
+      !timestampsOkPreview || tryButtonsWithTimeline
     );
     const wantMod = runtimeConfig.discordShowModButton === true;
     if (trackUrl && trackUrl !== lastButtonsComboTrackUrl) {
@@ -1637,11 +1656,9 @@ async function setActivity(track) {
       if (buttonsWithTimelineFailStreak > 0 && Date.now() >= buttonsWithTimelineBlockedUntil) {
         buttonsWithTimelineFailStreak = 0;
       }
-      // Новый трек — снова пробуем вторую кнопку (если галочка включена).
       if (wantMod) modButtonBlockedUntil = 0;
     }
     const modAllowedNow = wantMod && Date.now() >= modButtonBlockedUntil;
-    // Первую кнопку («Слушать трек») не заменяем и не убираем ради мода.
     /** @type {Array<'track+mod'|'track'>} */
     const buttonModes = !wantButtons
       ? []
@@ -1649,18 +1666,28 @@ async function setActivity(track) {
         ? ['track+mod', 'track']
         : ['track'];
 
-    let usedTimestamps = timestampsOk;
+    let usedTimestamps = timestampsOkPreview;
     let usedButtons = false;
     /** @type {'track+mod'|'track'|'none'} */
     let usedButtonMode = 'none';
     let lastBtnErr = null;
     let activityOk = false;
 
+    const commitPayload = async () => {
+      const out = await runSerializedRpcWrite(() => {
+        if (!rpc) return;
+        const fresh = applyFreshListeningTimestamps(payload, track, elapsedSec, totalSec);
+        usedTimestamps = fresh.timestampsOk;
+        return rpc.setActivity(payload);
+      });
+      return rpcWriteDidSend(out);
+    };
+
     if (buttonModes.length) {
       for (const mode of buttonModes) {
         applyDiscordButtonsToPayload(payload, trackUrl, mode);
         try {
-          await runSerializedRpcWrite(() => rpc.setActivity(payload));
+          if (!(await commitPayload())) continue;
           usedButtons = true;
           usedButtonMode = mode;
           activityOk = true;
@@ -1685,57 +1712,64 @@ async function setActivity(track) {
       }
     } else {
       try {
-        await runSerializedRpcWrite(() => rpc.setActivity(payload));
-        activityOk = true;
+        activityOk = await commitPayload();
       } catch (e) {
         lastBtnErr = e;
       }
     }
 
-    if (!activityOk && timestampsOk && wantButtons) {
-      // Тайм-бар важнее кнопок.
+    if (!activityOk && timestampsOkPreview && wantButtons) {
       stripDiscordButtonsFromPayload(payload);
       usedButtons = false;
       usedButtonMode = 'none';
       try {
-        await runSerializedRpcWrite(() => rpc.setActivity(payload));
-        activityOk = true;
-        buttonsWithTimelineFailStreak += 1;
-        if (wantMod) {
-          modButtonBlockedUntil = Date.now() + 10 * 60 * 1000;
-          modButtonComboAccepted = false;
-        }
-        if (buttonsWithTimelineFailStreak >= 2) {
-          buttonsWithTimelineBlockedUntil = Date.now() + 10 * 60 * 1000;
-          log('Кнопки с тайм-баром временно отключены на 10 мин (Discord отклоняет комбинацию).');
+        if (await commitPayload()) {
+          activityOk = true;
+          buttonsWithTimelineFailStreak += 1;
+          if (wantMod) {
+            modButtonBlockedUntil = Date.now() + 10 * 60 * 1000;
+            modButtonComboAccepted = false;
+          }
+          if (buttonsWithTimelineFailStreak >= 2) {
+            buttonsWithTimelineBlockedUntil = Date.now() + 10 * 60 * 1000;
+            log('Кнопки с тайм-баром временно отключены на 10 мин (Discord отклоняет комбинацию).');
+          }
         }
       } catch (e2) {
         log('setActivity только тайм-бар failed, retry без тайм-бара:', e2.message);
-        delete payload.startTimestamp;
-        delete payload.endTimestamp;
         usedTimestamps = false;
-        // Без тайм-бара снова: трек (+ мод если включён), без замены первой кнопки.
         applyDiscordButtonsToPayload(payload, trackUrl, wantMod ? 'track+mod' : 'track');
         usedButtons = true;
         usedButtonMode = wantMod ? 'track+mod' : 'track';
-        await runSerializedRpcWrite(() => rpc.setActivity(payload));
-        activityOk = true;
+        // Без тайм-бара: не ставим timestamps в applyFresh — форсим выключение.
+        const out = await runSerializedRpcWrite(() => {
+          if (!rpc) return;
+          delete payload.startTimestamp;
+          delete payload.endTimestamp;
+          return rpc.setActivity(payload);
+        });
+        activityOk = rpcWriteDidSend(out);
       }
-    } else if (!activityOk && timestampsOk) {
+    } else if (!activityOk && timestampsOkPreview) {
       log('setActivity с тайм-баром failed, retry without timestamps:', lastBtnErr && lastBtnErr.message);
-      delete payload.startTimestamp;
-      delete payload.endTimestamp;
       usedTimestamps = false;
       if (trackUrl) {
         applyDiscordButtonsToPayload(payload, trackUrl, wantMod ? 'track+mod' : 'track');
         usedButtons = true;
         usedButtonMode = wantMod ? 'track+mod' : 'track';
       }
-      await runSerializedRpcWrite(() => rpc.setActivity(payload));
-      activityOk = true;
-    } else if (!activityOk) {
-      throw lastBtnErr || new Error('setActivity failed');
+      const out = await runSerializedRpcWrite(() => {
+        if (!rpc) return;
+        delete payload.startTimestamp;
+        delete payload.endTimestamp;
+        return rpc.setActivity(payload);
+      });
+      activityOk = rpcWriteDidSend(out);
+    } else if (!activityOk && lastBtnErr) {
+      throw lastBtnErr;
     }
+
+    if (!activityOk) return false;
 
     if (trackUrl !== lastSentButtonUrl || usedButtonMode !== lastLoggedButtonMode) {
       lastSentButtonUrl = trackUrl || lastSentButtonUrl;
@@ -1760,8 +1794,10 @@ async function setActivity(track) {
       usedButtons ? `(кнопки:${usedButtonMode})` : '(без кнопок)',
       lastSentLargeText ? `coverText=${lastSentLargeText}` : '',
     );
+    return true;
   } catch (e) {
     log('Ошибка setActivity:', e.message);
+    return false;
   }
 }
 
@@ -1792,14 +1828,15 @@ async function clearActivity(opts = {}) {
     return;
   }
   try {
-    await runSerializedRpcWrite(() => {
+    const out = await runSerializedRpcWrite(() => {
       if (!rpc || typeof rpc.clearActivity !== 'function') return undefined;
       return rpc.clearActivity();
     });
+    // Локально считаем сброшенным даже при skip (реконнект) — не спамим очередь.
     lastSentTrackKey = '__cleared__';
-    if (!silent) log('Статус сброшен.');
     lastSentButtonUrl = null;
     lastLoggedButtonMode = null;
+    if (rpcWriteDidSend(out) && !silent) log('Статус сброшен.');
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
     // Обрыв Discord / реконнект — не засоряем лог.
@@ -3141,7 +3178,7 @@ function runHttpServer() {
                   'endsAtMs=', endsAtMs != null ? Math.round(endsAtMs / 1000) : null
                 );
               }
-              await setActivity({
+              const sent = await setActivity({
                 title,
                 artist,
                 album,
@@ -3159,11 +3196,13 @@ function runHttpServer() {
                 discordEndMs:
                   endsAtMs != null && Number.isFinite(endsAtMs) ? endsAtMs : undefined,
               });
-              if (timelineAtEnd) {
-                lastDiscordTimelineAtEnd = true;
+              if (sent) {
+                if (timelineAtEnd) {
+                  lastDiscordTimelineAtEnd = true;
+                }
+                lastSentTrackKey = key;
+                lastDiscordActivityAt = Date.now();
               }
-              lastSentTrackKey = key;
-              lastDiscordActivityAt = now;
             }
             schedulePlayingIdleFromHttp();
           }

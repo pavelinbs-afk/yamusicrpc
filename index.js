@@ -1531,7 +1531,8 @@ let modComboBlockedUntil = 0;
  * Discord интерполирует полоску между вызовами setActivity; постоянно пересчитывать start от
  * `Date.now() − position` на каждом тике даёт «дёрганую» привязку и в ряде клиентов — залипание UI.
  * (2) Если end уже в прошлом или якорь не сходится с позицией (repeat/баги) — fallback:
- * `start = now − position`, `end = start + duration` с поджатием конца в будущее.
+ * `start = now − position`, `end = start + duration`.
+ * Не удлиняем только end (это откатывало полоску). В хвосте вызывающий код должен clear, не «без тайм-бара».
  */
 function computeDiscordListeningTimestamps(elapsedSec, durationSec, nowMs, offsetMs) {
   if (
@@ -1544,12 +1545,15 @@ function computeDiscordListeningTimestamps(elapsedSec, durationSec, nowMs, offse
     return { startAdjusted: null, endAdjusted: null };
   }
   const durMs = Math.max(durationSec * 1000, 2000);
-  const posMs = Math.min(Math.max(0, elapsedSec * 1000), Math.max(durMs - 1000, 0));
-  const startLocal = nowMs - posMs;
+  const posMs = Math.min(Math.max(0, elapsedSec * 1000), durMs);
+  let startLocal = nowMs - posMs;
   let endLocal = startLocal + durMs;
   // Discord молча дропает activity, если end уже в прошлом или почти сейчас.
+  // Держим span = duration: сдвигаем пару start/end, не удлиняем только end.
   if (endLocal <= nowMs + 1500) {
-    endLocal = nowMs + Math.max(durMs - posMs, 2000);
+    const remainMs = Math.max(durMs - posMs, 500);
+    endLocal = nowMs + remainMs;
+    startLocal = endLocal - durMs;
   }
   const startAdjusted = startLocal - offsetMs;
   const endAdjusted = endLocal - offsetMs;
@@ -1620,9 +1624,11 @@ function applyFreshListeningTimestamps(payload, track, elapsedSec, totalSec) {
   const hasValidEnd = startAdjusted != null && endAdjusted != null;
   let startMs = hasValidEnd ? toDiscordRpcUnixMs(startAdjusted) : undefined;
   let endMs = hasValidEnd ? toDiscordRpcUnixMs(endAdjusted) : undefined;
-  if (typeof endMs === 'number' && endMs <= now + 1500) {
-    const remain = Math.max((totalSec - elapsedSec) * 1000, 2000);
-    endMs = now + remain;
+  if (typeof endMs === 'number' && typeof startMs === 'number' && endMs <= now + 1500) {
+    const durMs = Math.max(endMs - startMs, Math.round(totalSec * 1000), 2000);
+    const remainMs = Math.max(durMs - Math.max(0, elapsedSec * 1000), 500);
+    endMs = now + remainMs;
+    startMs = endMs - durMs;
   }
   const timestampsOk =
     typeof startMs === 'number' &&
@@ -2119,6 +2125,15 @@ async function ensureClientBridgeInstalled(opts = {}) {
     bridgeAutoState.lastStatus = st;
     if (st && st.installed) {
       log('Мост в клиенте: уже установлен', st.asarPath || '');
+      // Только при старте RPC (не на periodic): поднять клиент, если закрыт.
+      const wantLaunch =
+        opts.launchYm === true ||
+        opts.reason === 'startup' ||
+        opts.reason === 'retry_after_busy';
+      // Запуск YM в фоне — иначе spawn/PowerShell на старте вешают Electron UI.
+      if (wantLaunch && !isYandexMusicProcessRunning()) {
+        scheduleLaunchYandexMusicApp(st.asarPath || null, 'после старта RPC');
+      }
       return { ok: true, installed: true, already: true, ...st };
     }
     if (!force && !autoEnabled) {
@@ -2132,6 +2147,14 @@ async function ensureClientBridgeInstalled(opts = {}) {
       bridgeAutoState.lastAutoOk = true;
       bridgeAutoState.lastAutoError = null;
       log('Мост в клиенте: установлен автоматически', result.asarPath || '');
+      if (result.launchedYandexMusic) {
+        log('Яндекс.Музыка: запущена после установки моста');
+      } else if (!isYandexMusicProcessRunning()) {
+        scheduleLaunchYandexMusicApp(
+          result.asarPath || (st && st.asarPath) || null,
+          'после установки моста',
+        );
+      }
       return { ok: true, installed: true, auto: true, ...result };
     }
     const err = (result && result.error) || 'bridge install failed';
@@ -2350,76 +2373,305 @@ function clientBridgeFreshMs() {
   return Math.max(Number(runtimeConfig.desktopBrowserPriorityMs) || 12000, 15000);
 }
 
+/** После закрытия YM: короткая пауза на долетающие POST моста (не полные 12–15с). */
+const YM_GONE_BRIDGE_GRACE_MS = 2500;
+
 function isClientBridgeFresh(now = Date.now()) {
   const liveMs = clientBridgeFreshMs();
   return lastClientBridgePostAt > 0 && now - lastClientBridgePostAt < liveMs;
 }
 
-/**
- * Проверка процессов YM по пути установки (без кириллицы в фильтре имён —
- * иначе Get-Process/'Яндекс Музыка' часто даёт ложный «закрыта»).
- * @returns {boolean}
- */
-function isYandexMusicProcessRunning() {
-  if (process.platform !== 'win32') return true;
-  const now = Date.now();
-  if (ymProcessCache.running != null && now - ymProcessCache.at < YM_PROCESS_CHECK_MS) {
-    return ymProcessCache.running;
-  }
-  let running = false;
-  try {
-    for (const name of ['Y.Music.exe', 'YandexMusic.exe']) {
-      const r = spawnSync('tasklist', ['/FI', `IMAGENAME eq ${name}`, '/NH'], {
-        encoding: 'utf8',
-        timeout: 2500,
-        windowsHide: true,
-      });
-      const out = `${r.stdout || ''}${r.stderr || ''}`;
-      if (out && !/no tasks|информац|info:/i.test(out) && out.toLowerCase().includes(name.toLowerCase())) {
-        running = true;
-        break;
-      }
-    }
-  } catch (_) {}
-  if (!running) {
-    try {
-      // Только клиент из …\YandexMusic\… — не наш «Yandex Music RPC».
-      const ps = [
-        "$ErrorActionPreference='SilentlyContinue'",
-        [
-          "$p = Get-CimInstance Win32_Process | Where-Object {",
-          "$_.Name -eq 'Y.Music.exe' -or $_.Name -eq 'YandexMusic.exe' -or",
-          "($_.ExecutablePath -and $_.ExecutablePath -match '[\\\\/]YandexMusic[\\\\/]' -and $_.ExecutablePath -notmatch 'discord-rpc|Yandex Music RPC')",
-          '} | Select-Object -First 1 -ExpandProperty ProcessId',
-        ].join(' '),
-        'if ($p) { Write-Output $p }',
-      ].join('; ');
-      const r = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
-        encoding: 'utf8',
-        timeout: 5000,
-        windowsHide: true,
-      });
-      if ((r.stdout || '').trim()) running = true;
-    } catch (_) {}
-  }
-  ymProcessCache = { at: now, running };
-  return running;
+function clientBridgeAgeMs(now = Date.now()) {
+  if (!(lastClientBridgePostAt > 0)) return Number.POSITIVE_INFINITY;
+  return Math.max(0, now - lastClientBridgePostAt);
 }
 
 /**
- * YM «жива», если процесс найден ИЛИ мост недавно прислал трек
- * (мост = железобетонное доказательство, что клиент открыт).
- * Не пишет в ymProcessCache — иначе grace моста «отравляет» кэш процесса.
+ * Async spawn с захватом stdout/stderr. Не блокирует event loop (в отличие от spawnSync).
+ * @returns {Promise<{ status: number, stdout: string, stderr: string, timedOut?: boolean }>}
+ */
+function spawnCaptured(command, args, opts = {}) {
+  const timeoutMs = Math.max(500, Number(opts.timeout) || 8000);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    let child;
+    try {
+      child = spawn(command, args, {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        ...opts,
+        timeout: undefined,
+      });
+    } catch (e) {
+      finish({ status: 1, stdout: '', stderr: String(e && e.message ? e.message : e) });
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch (_) {}
+      finish({ status: -1, stdout, stderr, timedOut: true });
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { stdout += String(d); });
+    child.stderr.on('data', (d) => { stderr += String(d); });
+    child.on('error', (e) => {
+      finish({ status: 1, stdout, stderr: String(e && e.message ? e.message : e) });
+    });
+    child.on('close', (code) => {
+      finish({ status: code == null ? 1 : code, stdout, stderr });
+    });
+  });
+}
+
+let ymProcessRefreshInFlight = null;
+
+/**
+ * Только кэш — никогда не блокирует UI/HTTP.
+ * Пока кэш пуст: optimistic true (не срываем статус на старте).
+ */
+function isYandexMusicProcessRunning() {
+  if (process.platform !== 'win32') return true;
+  if (ymProcessCache.running == null) return true;
+  return ymProcessCache.running === true;
+}
+
+/** Фоновый опрос процессов YM (tasklist / CIM) без spawnSync. */
+async function refreshYandexMusicProcessRunning() {
+  if (process.platform !== 'win32') {
+    ymProcessCache = { at: Date.now(), running: true };
+    return true;
+  }
+  if (ymProcessRefreshInFlight) return ymProcessRefreshInFlight;
+  ymProcessRefreshInFlight = (async () => {
+    let running = false;
+    try {
+      const names = ['Y.Music.exe', 'YandexMusic.exe', 'Яндекс Музыка.exe'];
+      for (const name of names) {
+        const r = await spawnCaptured('tasklist', ['/FI', `IMAGENAME eq ${name}`, '/NH'], {
+          timeout: 2500,
+        });
+        const out = `${r.stdout || ''}${r.stderr || ''}`;
+        if (out && !/no tasks|информац|info:/i.test(out) && out.toLowerCase().includes(name.toLowerCase())) {
+          running = true;
+          break;
+        }
+      }
+      if (!running) {
+        const ps =
+          "$ErrorActionPreference='SilentlyContinue'; " +
+          "$p = Get-CimInstance Win32_Process | Where-Object { " +
+          "$_.Name -eq 'Y.Music.exe' -or $_.Name -eq 'YandexMusic.exe' -or $_.Name -eq 'Яндекс Музыка.exe' -or " +
+          "($_.ExecutablePath -and ($_.ExecutablePath -match '[\\\\/]YandexMusic[\\\\/]') -and ($_.ExecutablePath -notmatch 'discord-rpc|Yandex Music RPC')) " +
+          '} | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) { Write-Output $p }';
+        const b64 = Buffer.from(ps, 'utf16le').toString('base64');
+        const r = await spawnCaptured(
+          'powershell',
+          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64],
+          { timeout: 8000 },
+        );
+        if ((r.stdout || '').trim()) running = true;
+      }
+    } catch (_) {
+      running = ymProcessCache.running === true;
+    }
+    ymProcessCache = { at: Date.now(), running };
+    return running;
+  })();
+  try {
+    return await ymProcessRefreshInFlight;
+  } finally {
+    ymProcessRefreshInFlight = null;
+  }
+}
+
+function startYandexMusicProcessWatch() {
+  if (process.platform !== 'win32') return;
+  refreshYandexMusicProcessRunning().catch(() => {});
+  setInterval(() => {
+    refreshYandexMusicProcessRunning().catch(() => {});
+  }, YM_PROCESS_CHECK_MS);
+}
+
+/**
+ * YM «жива», если процесс найден.
+ * Мост даёт короткий grace только когда процесс уже не виден (долетающие POST),
+ * а не 12–15с удержания статуса после закрытия клиента.
  */
 function isYandexMusicAlive() {
-  if (isClientBridgeFresh()) return true;
-  return isYandexMusicProcessRunning();
+  if (isYandexMusicProcessRunning()) return true;
+  return clientBridgeAgeMs() < YM_GONE_BRIDGE_GRACE_MS;
+}
+
+function findYandexMusicExePath(asarPath) {
+  const roots = [];
+  if (asarPath) {
+    try {
+      roots.push(path.dirname(path.dirname(path.resolve(asarPath))));
+    } catch (_) {}
+  }
+  const local = process.env.LOCALAPPDATA || '';
+  if (local) roots.push(path.join(local, 'Programs', 'YandexMusic'));
+  const preferred = ['Яндекс Музыка.exe', 'Y.Music.exe', 'YandexMusic.exe', 'Yandex Music.exe'];
+  for (const root of roots) {
+    for (const name of preferred) {
+      const p = path.join(root, name);
+      try {
+        if (fs.existsSync(p)) return p;
+      } catch (_) {}
+    }
+  }
+  return null;
+}
+
+function sleepMsAsync(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms | 0)));
+}
+
+/**
+ * Запуск Яндекс.Музыки из RPC — полностью async, без spawnSync.
+ */
+async function launchYandexMusicApp(asarPath) {
+  if (process.platform !== 'win32') {
+    return { ok: false, launchedYandexMusic: false, error: 'not_windows' };
+  }
+  await refreshYandexMusicProcessRunning();
+  if (isYandexMusicProcessRunning()) {
+    return { ok: true, launchedYandexMusic: false, alreadyRunning: true };
+  }
+  const exePath = findYandexMusicExePath(asarPath);
+  if (!exePath) {
+    return { ok: false, launchedYandexMusic: false, error: 'exe_not_found' };
+  }
+  const workDir = path.dirname(exePath);
+
+  /** @type {Array<[string, () => Promise<boolean>]>} */
+  const methods = [
+    [
+      'electron.shell.openPath',
+      async () => {
+        try {
+          const electron = require('electron');
+          const shell = electron && electron.shell;
+          if (!shell || typeof shell.openPath !== 'function') return false;
+          const err = await shell.openPath(exePath);
+          return !err;
+        } catch (_) {
+          return false;
+        }
+      },
+    ],
+    [
+      'powershell.Start-Process',
+      async () => {
+        const exeLit = exePath.replace(/'/g, "''");
+        const dirLit = workDir.replace(/'/g, "''");
+        const ps =
+          "$ErrorActionPreference='Stop'; " +
+          `Start-Process -FilePath '${exeLit}' -WorkingDirectory '${dirLit}'`;
+        const b64 = Buffer.from(ps, 'utf16le').toString('base64');
+        const r = await spawnCaptured(
+          'powershell',
+          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64],
+          { timeout: 20000 },
+        );
+        return r.status === 0;
+      },
+    ],
+    [
+      'explorer.exe',
+      async () => {
+        try {
+          const child = spawn('explorer.exe', [exePath], {
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: true,
+          });
+          child.unref();
+          return true;
+        } catch (_) {
+          return false;
+        }
+      },
+    ],
+    [
+      'spawn',
+      async () => {
+        try {
+          const child = spawn(exePath, [], {
+            detached: true,
+            stdio: 'ignore',
+            cwd: workDir,
+            windowsHide: false,
+          });
+          child.unref();
+          return true;
+        } catch (_) {
+          return false;
+        }
+      },
+    ],
+  ];
+
+  for (const [via, fn] of methods) {
+    await refreshYandexMusicProcessRunning();
+    if (isYandexMusicProcessRunning()) {
+      return { ok: true, launchedYandexMusic: false, alreadyRunning: true, exePath };
+    }
+    let ok = false;
+    try {
+      ok = !!(await fn());
+    } catch (_) {
+      ok = false;
+    }
+    if (!ok) continue;
+    await sleepMsAsync(2500);
+    await refreshYandexMusicProcessRunning();
+    if (isYandexMusicProcessRunning()) {
+      return { ok: true, launchedYandexMusic: true, exePath, via };
+    }
+  }
+  return { ok: false, launchedYandexMusic: false, exePath, error: 'launch_failed' };
+}
+
+/** Запуск YM в фоне — не держит ensureClientBridge / UI. */
+function scheduleLaunchYandexMusicApp(asarPath, reason) {
+  setImmediate(() => {
+    launchYandexMusicApp(asarPath)
+      .then((launchRes) => {
+        if (launchRes && launchRes.launchedYandexMusic) {
+          log(
+            'Яндекс.Музыка: запущена',
+            reason ? `(${reason})` : '',
+            launchRes.via ? `via ${launchRes.via}` : '',
+          );
+        } else if (launchRes && launchRes.alreadyRunning) {
+          log('Яндекс.Музыка: уже запущена');
+        } else {
+          log(
+            'Яндекс.Музыка: не открылась —',
+            (launchRes && (launchRes.error || launchRes.exePath)) || 'unknown',
+            'Запустите клиент вручную.',
+          );
+        }
+      })
+      .catch((e) => {
+        log('Яндекс.Музыка: ошибка запуска —', e && e.message ? e.message : e);
+      });
+  });
 }
 
 async function clearBecauseYandexMusicGone(reason) {
   if (ymGoneClearInFlight) return;
-  if (isClientBridgeFresh()) return;
+  await refreshYandexMusicProcessRunning();
   if (isYandexMusicProcessRunning()) return;
+  // Долетающие POST моста — коротко; не держим статус 12–15с после закрытия.
+  if (clientBridgeAgeMs() < YM_GONE_BRIDGE_GRACE_MS) return;
 
   const hadPresence =
     !presenceAlreadyClearedLocally() ||
@@ -2433,7 +2685,9 @@ async function clearBecauseYandexMusicGone(reason) {
   ymGoneClearInFlight = true;
   try {
     // Повторная проверка перед clear (процесс мог «найтись», мост — успеть написать).
-    if (isClientBridgeFresh() || clientBridgePostEpoch !== epochAtStart) return;
+    if (clientBridgePostEpoch !== epochAtStart) return;
+    if (clientBridgeAgeMs() < YM_GONE_BRIDGE_GRACE_MS) return;
+    await refreshYandexMusicProcessRunning();
     if (isYandexMusicProcessRunning()) return;
 
     // Таймеры гасим до await, иначе idle/pause могут снова поднять presence.
@@ -2444,7 +2698,8 @@ async function clearBecauseYandexMusicGone(reason) {
     if (clientBridgePostEpoch !== epochAtStart || lastClientBridgePostAt > stampAtStart) {
       return;
     }
-    if (isClientBridgeFresh()) return;
+    await refreshYandexMusicProcessRunning();
+    if (isYandexMusicProcessRunning() || clientBridgeAgeMs() < YM_GONE_BRIDGE_GRACE_MS) return;
 
     lastDesktopTrackKey = null;
     lastPrioritySourcePostAt = 0;
@@ -2832,10 +3087,21 @@ function runHttpServer() {
             lastPrioritySourcePostAt = Date.now();
             lastBrowserPostAt = lastPrioritySourcePostAt;
             if (src === 'client') {
-              lastClientBridgePostAt = lastPrioritySourcePostAt;
-              clientBridgePostEpoch += 1;
-              // Мягкий хинт на 1с кэша; «жива» определяется isClientBridgeFresh / процессом.
-              ymProcessCache = { at: Date.now(), running: true };
+              const ymProcUp =
+                process.platform !== 'win32' || isYandexMusicProcessRunning();
+              if (!ymProcUp && clientBridgeAgeMs() >= YM_GONE_BRIDGE_GRACE_MS) {
+                // Процесс закрыт, grace вышел — не продлеваем stamp и не поднимаем activity.
+                await clearBecauseYandexMusicGone('Яндекс.Музыка закрыта');
+                res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: true, cleared: true, reason: 'ym_closed' }));
+                return;
+              }
+              if (ymProcUp) {
+                lastClientBridgePostAt = lastPrioritySourcePostAt;
+                clientBridgePostEpoch += 1;
+              }
+              // Если процесс уже мёртв, но POST ещё в grace — принимаем трек без сдвига stamp,
+              // иначе закрытие YM бесконечно откладывалось бы каждым долетающим тиком.
             }
           }
           // Desktop без живого YM — игнор (GSMTC залипает).
@@ -3048,8 +3314,15 @@ function runHttpServer() {
               const seekHit = isClientLike
                 ? jumpFromLast > clientSeekThresh || jumpFromAnchor > clientSeekThresh + 1
                 : jumpFromLast > seekJumpSec || jumpFromAnchor > seekJumpSec + 2;
+              // Хвост: отстающий/залипший pos vs wall-clock — не seek (иначе clear → снова setActivity).
+              const nearEndStall =
+                durSec != null &&
+                durSec > 8 &&
+                posSec >= durSec - 15 &&
+                expectedFromLast >= posSec - 0.5 &&
+                expectedFromAnchor >= posSec - 0.5;
               // Для GSMTC сырая позиция часто врёт — там свой seek; для client/browser — ловим скраб.
-              if (!gsmtcTimeline && seekHit) {
+              if (!gsmtcTimeline && seekHit && !nearEndStall) {
                 currentTrackStart = now - posSec * 1000;
                 timelineSeeked = true;
                 log('DEBUG seek detected:', {
@@ -3189,8 +3462,12 @@ function runHttpServer() {
                 timelineSeeked = true;
                 if (raw < dur - 10) gsmtcDidResetToStart = true;
               } else if (dur > 0 && raw >= dur - 6) {
-                // У конца трека не крутим wall-clock — иначе «доигрывание» / повтор хвоста.
-                posSec = Math.min(raw, dur);
+                /*
+                 * Хвост: не прыгаем на отстающий raw — иначе Discord откатывает полоску.
+                 * Держим монотонный expected, но не дальше duration.
+                 */
+                const smooth = Math.max(raw, Math.min(expectedSec, dur));
+                posSec = Math.min(smooth, dur);
                 if (msg.paused) gsmtcStalePaused = true;
               } else {
                 posSec = dur > 0
@@ -3311,16 +3588,22 @@ function runHttpServer() {
           }
           const stuckLongEnough =
             positionStuckSinceMs != null && now - positionStuckSinceMs >= POSITION_STUCK_CLEAR_MS;
-          // Хвост трека (последние ~6с) без роста позиции — стоп/пауза в конце, не «доигрывание».
+          // Хвост: берём max(display, raw) и окно ~12с — клиент часто залипает за 6–8с до конца.
+          const posForEndCheck = Math.max(
+            elapsedForDisplaySec,
+            typeof posSec === 'number' && Number.isFinite(posSec) ? posSec : 0,
+            typeof pForDisplay === 'number' && Number.isFinite(pForDisplay) ? pForDisplay : 0,
+          );
           const nearTrackEnd =
             totalForDisplaySec > 8 &&
-            elapsedForDisplaySec >= totalForDisplaySec - 6;
+            (posForEndCheck >= totalForDisplaySec - 12 || timelineAtEnd || positionSaysNearEnd);
           const endHoldPause =
             nearTrackEnd &&
             !positionAdvancing &&
             (
               Boolean(msg.paused) ||
               stuckLongEnough ||
+              timelineAtEnd ||
               lastSentTrackKey === '__cleared_pause__' ||
               lastDiscordTimelineAtEnd ||
               pausedClearBlockedTrackKey === key
@@ -3329,7 +3612,7 @@ function runHttpServer() {
           const pausedFlag =
             gsmtcStalePaused ||
             (Boolean(msg.paused) && !positionAdvancing) ||
-            stuckLongEnough ||
+            (stuckLongEnough && !timelineSeeked) ||
             endHoldPause;
 
           if (pausedFlag) {
@@ -3349,24 +3632,42 @@ function runHttpServer() {
                 lastDiscordActivityAt = now;
                 positionStuckSinceMs = null;
                 pausedSinceMs = now; // не спамим clearActivity
-                if (nearTrackEnd) {
+                if (nearTrackEnd || timelineAtEnd) {
                   pausedClearBlockedTrackKey = key;
                   lastDiscordTimelineAtEnd = true;
                 }
                 log(
-                  nearTrackEnd
+                  nearTrackEnd || timelineAtEnd
                     ? 'Статус скрыт: конец трека / пауза в хвосте'
                     : 'Статус скрыт: пауза (только актуальное воспроизведение)',
                 );
+              } else if (nearTrackEnd || timelineAtEnd) {
+                // Уже скрыто — держим блок хвоста, не даём снова поднять 0:00.
+                pausedClearBlockedTrackKey = key;
+                lastDiscordTimelineAtEnd = true;
               }
             }
             // Во время короткого мигания paused не трогаем Discord — полоска у клиента доживёт сама.
           } else {
             pausedSinceMs = null;
             positionStuckSinceMs = null;
+            // Реальный уход с хвоста: перемотка/повтор в первую часть трека, не «seek» от отстающего pos.
+            const seekLeavesTrackEnd =
+              timelineSeeked &&
+              posSec != null &&
+              totalForDisplaySec > 8 &&
+              posSec < totalForDisplaySec - 20;
             // Не снимаем блокировку хвоста, пока тот же трек у конца без реального хода.
-            if (pausedClearBlockedTrackKey === key && nearTrackEnd && !positionAdvancing) {
-              // остаёмся «на паузе в конце» — не поднимаем playing снова
+            if (
+              (pausedClearBlockedTrackKey === key || lastDiscordTimelineAtEnd) &&
+              (nearTrackEnd || lastDiscordTimelineAtEnd) &&
+              !positionAdvancing &&
+              !cycleRestartDetected &&
+              !seekLeavesTrackEnd
+            ) {
+              // остаёмся «на паузе в конце» — не поднимаем playing снова (иначе Discord 0:00)
+              pausedClearBlockedTrackKey = key;
+              lastDiscordTimelineAtEnd = true;
               lastObservedTimelineKey = key || null;
               lastObservedElapsedSec = elapsedForDisplaySec;
               lastObservedWallMs = now;
@@ -3374,8 +3675,14 @@ function runHttpServer() {
               res.end(JSON.stringify({ ok: true, held: 'track_end_pause' }));
               return;
             }
-            if (pausedClearBlockedTrackKey === key && (!nearTrackEnd || positionAdvancing || cycleRestartDetected)) {
+            if (
+              pausedClearBlockedTrackKey === key &&
+              ((!nearTrackEnd && !lastDiscordTimelineAtEnd) || positionAdvancing || cycleRestartDetected || seekLeavesTrackEnd)
+            ) {
               pausedClearBlockedTrackKey = null;
+              if (seekLeavesTrackEnd || positionAdvancing || cycleRestartDetected) {
+                lastDiscordTimelineAtEnd = false;
+              }
             } else if (pausedClearBlockedTrackKey && pausedClearBlockedTrackKey !== key) {
               pausedClearBlockedTrackKey = null;
             }
@@ -3384,8 +3691,25 @@ function runHttpServer() {
               lastSentTrackKey === '__cleared_pause__' ||
               lastSentTrackKey === '__paused__' ||
               lastSentTrackKey == null;
-            // Резум / повтор того же трека / старт не с 00:00 после сброса — всегда якорим от текущей позиции.
-            if (presenceMissing && posSec != null) {
+            // Уже скрыли хвост — не поднимаем playing (ложный seek больше не обходит hold).
+            if (
+              presenceMissing &&
+              (nearTrackEnd || timelineAtEnd || lastDiscordTimelineAtEnd) &&
+              !positionAdvancing &&
+              !seekLeavesTrackEnd &&
+              !cycleRestartDetected
+            ) {
+              pausedClearBlockedTrackKey = key;
+              lastDiscordTimelineAtEnd = true;
+              lastObservedTimelineKey = key || null;
+              lastObservedElapsedSec = elapsedForDisplaySec;
+              lastObservedWallMs = now;
+              res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, held: 'track_end_cleared' }));
+              return;
+            }
+            // Резум / повтор: якорим от позиции. В хвосте НЕ сбрасываем start — иначе endsAtMs уезжает вперёд.
+            if (presenceMissing && posSec != null && !nearTrackEnd && !timelineAtEnd) {
               clearPausedClearTimerOnly();
               currentTrackStart = now - posSec * 1000;
               if (effectiveDurSec != null) {
@@ -3399,12 +3723,16 @@ function runHttpServer() {
               pausedSinceMs = null;
             }
             // Длительность пришла позже первого кадра — нужно дослать тайм-бар.
+            // Не чиним «тайм-бар» в хвосте: activity без timestamps → Discord показывает 0:00.
             const needTimestampsFix =
               !lastSentHadTimestamps &&
+              !timelineAtEnd &&
+              !nearTrackEnd &&
               effectiveDurSec != null &&
               effectiveDurSec > 0.5;
-            const needTimelineEndFix = timelineAtEnd && !lastDiscordTimelineAtEnd;
-            const needTimelineRestoreFix = !timelineAtEnd && wasTimelineAtEnd;
+            // Конец трека: только clear (см. endHoldPause), не setActivity без полоски.
+            const needTimelineEndFix = false;
+            const needTimelineRestoreFix = !timelineAtEnd && wasTimelineAtEnd && !nearTrackEnd;
             const needCycleRestartFix = cycleRestartDetected;
             const nextCoverKey =
               coverUrl && isAllowedCoverUrl(coverUrl) ? coverUrl.slice(0, 512) : '';
@@ -3416,10 +3744,13 @@ function runHttpServer() {
               lastSentTrackKey !== '__cleared_pause__' &&
               lastSentTrackKey !== '__paused__';
             // Client: как BetaMod — каждые ~10с пересчитываем start/end от живой позиции.
+            // В хвосте не трогаем — resync от отстающей позиции откатывает полоску.
             if (
               isClientLike &&
               samePlayingTrack &&
               !timelineSeeked &&
+              !nearTrackEnd &&
+              !timelineAtEnd &&
               posSec != null &&
               now - lastDiscordActivityAt >= CLIENT_ACTIVITY_RESYNC_MS
             ) {
@@ -3433,18 +3764,20 @@ function runHttpServer() {
               samePlayingTrack &&
               (clientTimelineResync ||
                 now - lastDiscordActivityAt >= DISCORD_PLAYING_HEARTBEAT_MS);
+            // После clear в хвосте не поднимаем activity ложным seek / presenceMissing.
+            const allowRaiseNearEnd = seekLeavesTrackEnd || cycleRestartDetected || positionAdvancing;
             const canUpdate =
-              key !== lastSentTrackKey ||
-              presenceMissing ||
+              (key !== lastSentTrackKey && !(nearTrackEnd && presenceMissing && !allowRaiseNearEnd)) ||
+              (presenceMissing && (!nearTrackEnd || allowRaiseNearEnd)) ||
               needTimestampsFix ||
               needTimelineEndFix ||
               needTimelineRestoreFix ||
               needCycleRestartFix ||
               gsmtcDidResetToStart ||
-              timelineSeeked ||
+              (timelineSeeked && (!nearTrackEnd || allowRaiseNearEnd)) ||
               clientTimelineResync ||
-              needCoverFix ||
-              needCaptionFix ||
+              (needCoverFix && !presenceMissing) ||
+              (needCaptionFix && !presenceMissing) ||
               needHeartbeat;
             if (!canUpdate) {
               log('DEBUG throttled:', {
@@ -3479,9 +3812,13 @@ function runHttpServer() {
                 positionSec: elapsedForDisplaySec,
                 durationSec: effectiveDurSec != null ? effectiveDurSec : totalForDisplaySec,
                 url: trackUrl,
-                // Client + перемотка: всегда пересчитываем start/end от позиции (BetaMod).
+                // Client + перемотка: start/end от позиции (BetaMod). В хвосте — стабильный якорь.
                 forceTimelineFromPosition:
-                  Boolean(isClientLike && posSec != null) || timelineSeeked || clientTimelineResync,
+                  (
+                    Boolean(isClientLike && posSec != null && !nearTrackEnd && !timelineAtEnd) ||
+                    timelineSeeked ||
+                    clientTimelineResync
+                  ),
                 discordStartMs:
                   currentTrackStart != null && Number.isFinite(currentTrackStart)
                     ? currentTrackStart
@@ -3578,8 +3915,9 @@ async function main() {
 
   runHttpServer();
   startDesktopPoller();
+  startYandexMusicProcessWatch();
 
-  // Автоустановка моста после старта (не блокируем Discord/HTTP).
+  // Автоустановка моста после старта (не блокируем Discord/HTTP/UI).
   setTimeout(() => {
     ensureClientBridgeInstalled({ reason: 'startup' }).catch(() => {});
   }, 2500);

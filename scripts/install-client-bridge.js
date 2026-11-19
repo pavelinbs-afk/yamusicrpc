@@ -127,15 +127,53 @@ function resolveAsarPath(explicit) {
 
 function findYandexExe(asarPath) {
   const root = path.dirname(path.dirname(asarPath)); // .../YandexMusic
+  const preferred = ['Яндекс Музыка.exe', 'Y.Music.exe', 'YandexMusic.exe', 'Yandex Music.exe'];
+  for (const name of preferred) {
+    const p = path.join(root, name);
+    if (fs.existsSync(p)) return p;
+  }
   try {
     const names = fs.readdirSync(root);
     for (const n of names) {
       if (!/\.exe$/i.test(n)) continue;
-      if (/uninstall|elevate/i.test(n)) continue;
+      if (/uninstall|elevate|update|crash|helper|proxy/i.test(n)) continue;
       return path.join(root, n);
     }
   } catch (_) {}
   return null;
+}
+
+function isYandexMusicExeRunning() {
+  if (process.platform !== 'win32') return false;
+  // CIM по пути установки — надёжнее tasklist с кириллическим IMAGENAME.
+  try {
+    const ps =
+      "$ErrorActionPreference='SilentlyContinue'; " +
+      "$p = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -match '[\\\\/]YandexMusic[\\\\/]') -and ($_.ExecutablePath -notmatch 'discord-rpc|Yandex Music RPC') } | Select-Object -First 1 -ExpandProperty ProcessId; " +
+      'if ($p) { Write-Output $p }';
+    const b64 = Buffer.from(ps, 'utf16le').toString('base64');
+    const r = spawnSync(
+      'powershell',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64],
+      { encoding: 'utf8', timeout: 8000, windowsHide: true },
+    );
+    if ((r.stdout || '').trim()) return true;
+  } catch (_) {}
+  const images = ['Y.Music.exe', 'YandexMusic.exe', 'Яндекс Музыка.exe'];
+  for (const img of images) {
+    try {
+      const r = spawnSync('tasklist', ['/FI', `IMAGENAME eq ${img}`, '/NH'], {
+        encoding: 'utf8',
+        timeout: 2500,
+        windowsHide: true,
+      });
+      const out = `${r.stdout || ''}${r.stderr || ''}`;
+      if (out && !/no tasks|информац|info:/i.test(out) && out.toLowerCase().includes(img.toLowerCase())) {
+        return true;
+      }
+    } catch (_) {}
+  }
+  return false;
 }
 
 function sleepMs(ms) {
@@ -173,25 +211,22 @@ function forceCloseYandexMusic(asarPath) {
 
   // 1) По пути установки (надёжнее, чем по имени — exe может быть «Яндекс Музыка.exe»).
   if (installRoot) {
-    const ps = [
-      "$ErrorActionPreference='SilentlyContinue'",
-      `$root = '${installRoot}'`,
-      '$pids = @()',
-      'Get-CimInstance Win32_Process | ForEach-Object {',
-      '  $p = $_.ExecutablePath',
-      '  if ($p -and $p.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {',
-      '    $pids += $_.ProcessId',
-      '    try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}',
-      '  }',
-      '}',
-      '$pids.Count',
-    ].join('; ');
+    // Одна строка + EncodedCommand: join(';') ломает ForEach-Object { ... }.
+    const ps =
+      "$ErrorActionPreference='SilentlyContinue'; " +
+      `$root = '${installRoot}'; ` +
+      '$n = 0; Get-CimInstance Win32_Process | ForEach-Object { ' +
+      '$p = $_.ExecutablePath; ' +
+      'if ($p -and $p.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { ' +
+      '$n++; try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} } }; ' +
+      'Write-Output $n';
     try {
-      const r = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
-        encoding: 'utf8',
-        timeout: 25000,
-        windowsHide: true,
-      });
+      const b64 = Buffer.from(ps, 'utf16le').toString('base64');
+      const r = spawnSync(
+        'powershell',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64],
+        { encoding: 'utf8', timeout: 25000, windowsHide: true },
+      );
       const n = parseInt(String(r.stdout || '').trim().split(/\r?\n/).pop(), 10);
       if (Number.isFinite(n) && n > 0) {
         killed += n;
@@ -372,21 +407,94 @@ async function install(asarPath) {
   };
 }
 
-/** Запуск клиента после установки моста (asar уже перезаписан). */
-function launchYandexMusic(exePath) {
-  if (!exePath || !fs.existsSync(exePath)) return false;
+/** PowerShell -EncodedCommand (UTF-16LE) — кириллические пути не ломаются в -Command. */
+function runPowerShellEncoded(script, timeoutMs = 15000) {
+  const b64 = Buffer.from(String(script), 'utf16le').toString('base64');
+  return spawnSync(
+    'powershell',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64],
+    { encoding: 'utf8', timeout: timeoutMs, windowsHide: true },
+  );
+}
+
+/**
+ * Запуск YM. На Windows: Start-Process через -EncodedCommand, иначе spawn с cwd.
+ */
+function trySpawnYandexMusic(exePath) {
+  const workDir = path.dirname(exePath);
+  if (process.platform === 'win32') {
+    const exeLit = String(exePath).replace(/'/g, "''");
+    const dirLit = String(workDir).replace(/'/g, "''");
+    const ps =
+      "$ErrorActionPreference='Stop'; " +
+      `Start-Process -FilePath '${exeLit}' -WorkingDirectory '${dirLit}'`;
+    const r = runPowerShellEncoded(ps, 20000);
+    if (r.status === 0) return true;
+    // Fallback 1: explorer (иногда поднимает GUI, когда CreateProcess из Electron молчит).
+    try {
+      const child = spawn('explorer.exe', [exePath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+      return true;
+    } catch (_) {}
+    // Fallback 2: прямой CreateProcess с cwd установки.
+    try {
+      const child = spawn(exePath, [], {
+        detached: true,
+        stdio: 'ignore',
+        cwd: workDir,
+        windowsHide: false,
+      });
+      child.unref();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
   try {
-    sleepMs(600);
-    const child = spawn(exePath, [], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: false,
-    });
+    const child = spawn(exePath, [], { detached: true, stdio: 'ignore', cwd: workDir });
     child.unref();
     return true;
   } catch (_) {
     return false;
   }
+}
+
+/** Запуск клиента после установки моста / старта RPC. true только если процесс реально жив. */
+function launchYandexMusic(exePath) {
+  if (!exePath || !fs.existsSync(exePath)) return false;
+  sleepMs(900);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) sleepMs(1200);
+    try {
+      trySpawnYandexMusic(exePath);
+    } catch (_) {}
+    // Дать Electron-клиенту подняться.
+    sleepMs(2500);
+    if (isYandexMusicExeRunning()) return true;
+  }
+  return false;
+}
+
+/** Запустить YM, если ещё не запущена. */
+function launchYandexMusicIfNeeded(asarPath) {
+  if (isYandexMusicExeRunning()) {
+    return { ok: true, launchedYandexMusic: false, alreadyRunning: true };
+  }
+  const exePath = asarPath ? findYandexExe(asarPath) : null;
+  if (!exePath) {
+    return { ok: false, launchedYandexMusic: false, error: 'exe_not_found' };
+  }
+  const launched = launchYandexMusic(exePath);
+  return {
+    ok: launched,
+    launchedYandexMusic: launched,
+    exePath,
+    error: launched ? undefined : 'launch_failed',
+  };
 }
 
 async function uninstall(asarPath) {
@@ -474,10 +582,11 @@ function status(asarPath) {
 }
 
 function parseArgs(argv) {
-  const out = { uninstall: false, status: false, asar: null };
+  const out = { uninstall: false, status: false, launch: false, asar: null };
   for (const a of argv) {
     if (a === '--uninstall') out.uninstall = true;
     else if (a === '--status') out.status = true;
+    else if (a === '--launch' || a === '--launch-if-needed') out.launch = true;
     else if (a.startsWith('--asar=')) out.asar = a.slice('--asar='.length);
   }
   return out;
@@ -494,6 +603,11 @@ async function main() {
     const st = status(asarPath);
     console.log(JSON.stringify(st, null, 2));
     process.exit(st.ok ? 0 : 1);
+  }
+  if (args.launch) {
+    const res = launchYandexMusicIfNeeded(asarPath);
+    console.log(JSON.stringify(res, null, 2));
+    process.exit(res.ok || res.alreadyRunning ? 0 : 1);
   }
   if (!asarPath) {
     const payload = {
@@ -539,6 +653,8 @@ module.exports = {
   resolveAsarPath,
   forceCloseYandexMusic,
   launchYandexMusic,
+  launchYandexMusicIfNeeded,
+  findYandexExe,
   install,
   uninstall,
   status,

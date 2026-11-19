@@ -83,25 +83,42 @@
     return null;
   }
 
+  function isElementVisible(el) {
+    if (!el) return false;
+    try {
+      const st = window.getComputedStyle(el);
+      if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+      if (Number(st.opacity) === 0) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 2 && r.height > 2;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function isPlaying(player) {
-    // Vibe: анимация играет только во время playback — самый надёжный сигнал.
+    // Vibe: анимация только во время playback.
     if (player.querySelector(PLAYING_ANIM_SELECTOR)) return true;
-    const pauseButton = player.querySelector(PAUSE_BUTTON_SELECTOR);
-    if (pauseButton) return true;
     try {
       const ps = navigator.mediaSession && navigator.mediaSession.playbackState;
       if (ps === 'playing') return true;
-      if (ps === 'paused') return false;
+      if (ps === 'paused' || ps === 'none') return false;
     } catch (_) {}
+    // Важно: PAUSE_BUTTON часто остаётся в DOM скрытым — смотрим видимость.
+    const pauseButton = player.querySelector(PAUSE_BUTTON_SELECTOR);
     const playButton = player.querySelector(PLAY_BUTTON_SELECTOR);
-    if (playButton) {
+    const pauseVis = isElementVisible(pauseButton);
+    const playVis = isElementVisible(playButton);
+    if (pauseVis && !playVis) return true;
+    if (playVis && !pauseVis) return false;
+    if (pauseVis) return true;
+    if (playVis) {
       const pressed = playButton.getAttribute('aria-pressed');
       if (pressed === 'true') return true;
       if (pressed === 'false') return false;
       const label = (playButton.getAttribute('aria-label') || playButton.getAttribute('title') || '').toLowerCase();
       if (/пауза|pause/.test(label)) return true;
       if (/игра|play|воспроизв/.test(label)) return false;
-      // Кнопка PLAY в DOM без анимации/паузы → скорее пауза.
       return false;
     }
     return null;
@@ -813,8 +830,8 @@
       // Позиция растёт ≈ в реальном времени — трек играет, даже если UI врёт.
       if (delta > 0.35 && delta < dt * 2.5 + 1.5) {
         lastInferredPlaying = true;
-      } else if (Math.abs(delta) < 0.25 && dt > 1.5) {
-        // Таймкод стоит — пауза (в т.ч. если опрос реже 8с).
+      } else if (Math.abs(delta) < 0.25 && dt > 1.0) {
+        // Таймкод стоит — пауза (волна/плейлист часто врут UI «играет»).
         lastInferredPlaying = false;
       }
     }

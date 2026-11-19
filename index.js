@@ -90,7 +90,8 @@ function isYandexAppMarketingTitle(title, artist, album) {
 
 
 const DISCORD_FIXED_TRACK_BTN_LABEL = '🎵 Слушать трек';
-const DISCORD_FIXED_MOD_BTN_LABEL = '💻 Яндекс Музыка Мод';
+/** Без эмодзи на 2-й кнопке — Discord иначе часто отклоняет комбо. */
+const DISCORD_FIXED_MOD_BTN_LABEL = 'Яндекс Музыка RPC';
 const DISCORD_FIXED_MOD_BTN_URL = 'https://github.com/pavelinbs-afk/yamusicrpc';
 
 const HTTP_PORT = 8765;
@@ -162,6 +163,8 @@ let discordReconnectInProgress = false;
 let rpcShutdownStarted = false;
 /** Последний пост от приоритетного источника (client / browser). */
 let lastPrioritySourcePostAt = 0;
+/** Последний пост именно от моста в клиенте (source=client). */
+let lastClientBridgePostAt = 0;
 let lastActiveSource = 'none';
 let lastDesktopTrackKey = null;
 /** Совместимость со старыми ссылками в коде. */
@@ -185,6 +188,8 @@ const PAUSE_CONFIRM_MS = 1100;
 /** Позиция не двигается — считаем паузой/залипанием и скрываем status. */
 let positionStuckSinceMs = null;
 const POSITION_STUCK_CLEAR_MS = 2000;
+/** Как часто проверяем, жив ли процесс Яндекс.Музыки. */
+const YM_PROCESS_CHECK_MS = 1000;
 /** Последнее наблюдаемое положение таймлайна для детекта нового цикла repeat при том же key. */
 let lastObservedTimelineKey = null;
 let lastObservedElapsedSec = null;
@@ -588,26 +593,36 @@ function runSerializedRpcWrite(task) {
       if (timer) clearTimeout(timer);
     }
   };
-  const next = rpcWriteChain.then(gated, gated);
-  rpcWriteChain = next.catch((e) => {
-    if (e && e.message === 'RPC_WRITE_TIMEOUT') {
-      // Устаревшее поколение — Discord уже переподключаем, не долбим ещё раз.
-      if (gen !== rpcWriteGeneration) return { skipped: true };
-      logErr(
-        'Discord RPC: таймаут записи',
-        RPC_WRITE_TIMEOUT_MS,
-        'мс — запускаю переподключение RPC и восстановление статуса.',
-      );
-      forceRpcReconnectFromTimeout();
-    }
-    return { skipped: true };
-  });
+  const next = rpcWriteChain.then(gated, gated).then(
+    (v) => v,
+    (e) => {
+      // Не рвём очередь: таймаут → skip+reconnect; остальное → error для fallback кнопок.
+      if (e && e.message === 'RPC_WRITE_TIMEOUT') {
+        if (gen === rpcWriteGeneration) {
+          logErr(
+            'Discord RPC: таймаут записи',
+            RPC_WRITE_TIMEOUT_MS,
+            'мс — запускаю переподключение RPC и восстановление статуса.',
+          );
+          forceRpcReconnectFromTimeout();
+        }
+        return { skipped: true };
+      }
+      return { skipped: false, error: e };
+    },
+  );
+  rpcWriteChain = next.catch(() => ({ skipped: true }));
   return next;
 }
 
 /** true, если write реально ушёл в Discord (не no-op из‑за реконнекта). */
 function rpcWriteDidSend(out) {
-  return Boolean(out && out.skipped === false);
+  return Boolean(out && out.skipped === false && !out.error);
+}
+
+/** Проброс ошибки Discord SET_ACTIVITY из очереди записи. */
+function throwIfRpcWriteError(out) {
+  if (out && out.error) throw out.error;
 }
 
 /**
@@ -1437,30 +1452,46 @@ function pickLargeImage(track) {
   return { key: '', text: caption };
 }
 
+function discordModButtonSpec() {
+  const modUrl = DISCORD_FIXED_MOD_BTN_URL.trim();
+  return modUrl && /^https?:\/\//i.test(modUrl)
+    ? { label: DISCORD_FIXED_MOD_BTN_LABEL.slice(0, 32), url: modUrl }
+    : null;
+}
+
+function discordTrackButtonSpec(trackUrl) {
+  return trackUrl
+    ? { label: DISCORD_FIXED_TRACK_BTN_LABEL.slice(0, 32), url: trackUrl }
+    : null;
+}
+
+function isDiscordShowTrackButton() {
+  if (typeof runtimeConfig.discordShowTrackButton === 'boolean') {
+    return runtimeConfig.discordShowTrackButton;
+  }
+  return runtimeConfig.discordTryButtonsWithTimeline !== false;
+}
+
 /**
- * Режимы кнопок Discord:
- *  - track — «Слушать трек» (по умолчанию при включённой интеграции)
- *  - track+mod — та же кнопка + вторая (мод); первую не заменяем и не убираем
+ * Режимы кнопок Discord (независимы):
+ *  - track — только «Слушать трек»
+ *  - mod — только мод
+ *  - track+mod — обе
  * @param {object} payload
  * @param {string} trackUrl
- * @param {'track'|'track+mod'} [mode]
+ * @param {'track'|'mod'|'track+mod'} [mode]
  */
 function applyDiscordButtonsToPayload(payload, trackUrl, mode = 'track') {
   if (!payload) return;
   stripDiscordButtonsFromPayload(payload);
-  const modUrl = DISCORD_FIXED_MOD_BTN_URL.trim();
-  const modBtn = modUrl && /^https?:\/\//i.test(modUrl)
-    ? { label: DISCORD_FIXED_MOD_BTN_LABEL.slice(0, 32), url: modUrl }
-    : null;
-  const trackBtn = trackUrl
-    ? { label: DISCORD_FIXED_TRACK_BTN_LABEL.slice(0, 32), url: trackUrl }
-    : null;
-  if (!trackBtn) return;
+  const modBtn = discordModButtonSpec();
+  const trackBtn = discordTrackButtonSpec(trackUrl);
 
   /** @type {{ label: string, url: string }[]} */
-  const buttons = (mode === 'track+mod' && modBtn)
-    ? [trackBtn, modBtn]
-    : [trackBtn];
+  const buttons = [];
+  if ((mode === 'track' || mode === 'track+mod') && trackBtn) buttons.push(trackBtn);
+  if ((mode === 'mod' || mode === 'track+mod') && modBtn) buttons.push(modBtn);
+  if (!buttons.length) return;
 
   payload.buttons = buttons;
   payload.button1_label = buttons[0].label;
@@ -1487,10 +1518,11 @@ function stripDiscordButtonsFromPayload(payload) {
 let buttonsWithTimelineBlockedUntil = 0;
 let buttonsWithTimelineFailStreak = 0;
 let lastButtonsComboTrackUrl = '';
-/** Пока активно — не пробуем вторую кнопку (мод), только «Слушать трек». */
-let modButtonBlockedUntil = 0;
-/** true — track+mod уже принимался Discord, продолжаем слать обе кнопки. */
-let modButtonComboAccepted = false;
+/**
+ * Короткий cooldown только на комбо track+mod (не блокирует мод отдельно).
+ * Раньше 10 мин «бан мода» после fallback на track фактически выключал 2-ю кнопку.
+ */
+let modComboBlockedUntil = 0;
 
 /**
  * Таймстампы для Discord Listening (type=2): нужна пара start/end (см. discord-rpc #227, Lachee).
@@ -1611,8 +1643,9 @@ function applyFreshListeningTimestamps(payload, track, elapsedSec, totalSec) {
  * @returns {Promise<boolean>} true — activity реально ушёл в Discord
  */
 async function setActivity(track) {
-  if (!rpc || !runtimeConfig.rpcEnabled) return false;
+  // Сначала якорим desired — иначе трек до rpc.ready теряется и после ready не восстанавливается.
   desiredPresence = { kind: 'playing', track: { ...track } };
+  if (!rpc || !runtimeConfig.rpcEnabled) return false;
   const { title = '', artist = '', url: trackUrl, positionSec, durationSec } = track;
 
   const p = typeof positionSec === 'number' && Number.isFinite(positionSec) ? Math.max(0, positionSec) : 0;
@@ -1642,36 +1675,51 @@ async function setActivity(track) {
       payload.largeImageText = discordAssetText(img.text);
     }
 
+    const wantTrack = isDiscordShowTrackButton() && Boolean(trackUrl);
+    const wantMod =
+      runtimeConfig.discordShowModButton === true && Boolean(discordModButtonSpec());
+    const buttonsBlocked = Date.now() < buttonsWithTimelineBlockedUntil;
     const tryButtonsWithTimeline =
-      Boolean(trackUrl) &&
+      (wantTrack || wantMod) &&
       timestampsOkPreview &&
-      runtimeConfig.discordTryButtonsWithTimeline !== false &&
-      Date.now() >= buttonsWithTimelineBlockedUntil;
-    const wantButtons = Boolean(trackUrl) && (
+      !buttonsBlocked;
+    // С тайм-баром: кнопки только если не в temporary block. Без тайм-бара — всегда, если включены.
+    const wantButtons = (wantTrack || wantMod) && (
       !timestampsOkPreview || tryButtonsWithTimeline
     );
-    const wantMod = runtimeConfig.discordShowModButton === true;
+
     if (trackUrl && trackUrl !== lastButtonsComboTrackUrl) {
       lastButtonsComboTrackUrl = trackUrl;
       if (buttonsWithTimelineFailStreak > 0 && Date.now() >= buttonsWithTimelineBlockedUntil) {
         buttonsWithTimelineFailStreak = 0;
       }
-      if (wantMod) modButtonBlockedUntil = 0;
+      // Смена трека — снова пробуем комбо, не копим «бан».
+      if (wantMod) modComboBlockedUntil = 0;
     }
-    const modAllowedNow = wantMod && Date.now() >= modButtonBlockedUntil;
-    /** @type {Array<'track+mod'|'track'>} */
-    const buttonModes = !wantButtons
-      ? []
-      : modAllowedNow
-        ? ['track+mod', 'track']
-        : ['track'];
+    const comboAllowedNow = wantTrack && wantMod && Date.now() >= modComboBlockedUntil;
+
+    /** @type {Array<'track+mod'|'track'|'mod'>} */
+    const buttonModes = [];
+    if (wantButtons) {
+      if (comboAllowedNow) buttonModes.push('track+mod');
+      if (wantTrack) buttonModes.push('track');
+      // мод отдельно — всегда, если включён (не зависит от бана комбо)
+      if (wantMod && !wantTrack) buttonModes.push('mod');
+    }
 
     let usedTimestamps = timestampsOkPreview;
     let usedButtons = false;
-    /** @type {'track+mod'|'track'|'none'} */
+    /** @type {'track+mod'|'track'|'mod'|'none'} */
     let usedButtonMode = 'none';
     let lastBtnErr = null;
     let activityOk = false;
+
+    const preferredButtonMode = () => {
+      if (comboAllowedNow) return 'track+mod';
+      if (wantTrack) return 'track';
+      if (wantMod) return 'mod';
+      return 'none';
+    };
 
     const commitPayload = async () => {
       const out = await runSerializedRpcWrite(() => {
@@ -1680,6 +1728,7 @@ async function setActivity(track) {
         usedTimestamps = fresh.timestampsOk;
         return rpc.setActivity(payload);
       });
+      throwIfRpcWriteError(out);
       return rpcWriteDidSend(out);
     };
 
@@ -1693,20 +1742,28 @@ async function setActivity(track) {
           activityOk = true;
           if (tryButtonsWithTimeline) buttonsWithTimelineFailStreak = 0;
           if (mode === 'track+mod') {
-            modButtonComboAccepted = true;
-          } else if (wantMod && modAllowedNow) {
-            modButtonComboAccepted = false;
-            modButtonBlockedUntil = Date.now() + 10 * 60 * 1000;
-            log('Вторая кнопка (мод) отклонена Discord — оставляем «Слушать трек» (повтор мода через 10 мин).');
+            modComboBlockedUntil = 0;
+          } else if (mode === 'track' && wantMod) {
+            // Короткий cooldown только на комбо; мод отдельно не трогаем.
+            modComboBlockedUntil = Date.now() + 60 * 1000;
+            log(
+              'Комбо «Слушать трек»+мод не принято — оставлен track. Повтор комбо через ~1 мин.',
+              'label=',
+              DISCORD_FIXED_MOD_BTN_LABEL,
+              'url=',
+              DISCORD_FIXED_MOD_BTN_URL,
+            );
           }
           break;
         } catch (e) {
           lastBtnErr = e;
           if (mode === 'track+mod') {
-            modButtonComboAccepted = false;
-            log('setActivity «Слушать трек» + мод отклонены:', e.message);
+            modComboBlockedUntil = Date.now() + 60 * 1000;
+            log('setActivity «Слушать трек» + мод отклонены:', e && e.message ? e.message : e);
+          } else if (mode === 'mod') {
+            log('setActivity кнопка мода отклонена:', e && e.message ? e.message : e);
           } else {
-            log('setActivity «Слушать трек» отклонена:', e.message);
+            log('setActivity «Слушать трек» отклонена:', e && e.message ? e.message : e);
           }
         }
       }
@@ -1727,8 +1784,7 @@ async function setActivity(track) {
           activityOk = true;
           buttonsWithTimelineFailStreak += 1;
           if (wantMod) {
-            modButtonBlockedUntil = Date.now() + 10 * 60 * 1000;
-            modButtonComboAccepted = false;
+            modComboBlockedUntil = Date.now() + 60 * 1000;
           }
           if (buttonsWithTimelineFailStreak >= 2) {
             buttonsWithTimelineBlockedUntil = Date.now() + 10 * 60 * 1000;
@@ -1738,25 +1794,29 @@ async function setActivity(track) {
       } catch (e2) {
         log('setActivity только тайм-бар failed, retry без тайм-бара:', e2.message);
         usedTimestamps = false;
-        applyDiscordButtonsToPayload(payload, trackUrl, wantMod ? 'track+mod' : 'track');
-        usedButtons = true;
-        usedButtonMode = wantMod ? 'track+mod' : 'track';
-        // Без тайм-бара: не ставим timestamps в applyFresh — форсим выключение.
+        const mode = preferredButtonMode();
+        if (mode !== 'none') {
+          applyDiscordButtonsToPayload(payload, trackUrl, mode);
+          usedButtons = true;
+          usedButtonMode = mode;
+        }
         const out = await runSerializedRpcWrite(() => {
           if (!rpc) return;
           delete payload.startTimestamp;
           delete payload.endTimestamp;
           return rpc.setActivity(payload);
         });
+        throwIfRpcWriteError(out);
         activityOk = rpcWriteDidSend(out);
       }
     } else if (!activityOk && timestampsOkPreview) {
       log('setActivity с тайм-баром failed, retry without timestamps:', lastBtnErr && lastBtnErr.message);
       usedTimestamps = false;
-      if (trackUrl) {
-        applyDiscordButtonsToPayload(payload, trackUrl, wantMod ? 'track+mod' : 'track');
+      const mode = preferredButtonMode();
+      if (mode !== 'none') {
+        applyDiscordButtonsToPayload(payload, trackUrl, mode);
         usedButtons = true;
-        usedButtonMode = wantMod ? 'track+mod' : 'track';
+        usedButtonMode = mode;
       }
       const out = await runSerializedRpcWrite(() => {
         if (!rpc) return;
@@ -1764,6 +1824,7 @@ async function setActivity(track) {
         delete payload.endTimestamp;
         return rpc.setActivity(payload);
       });
+      throwIfRpcWriteError(out);
       activityOk = rpcWriteDidSend(out);
     } else if (!activityOk && lastBtnErr) {
       throw lastBtnErr;
@@ -1777,7 +1838,8 @@ async function setActivity(track) {
       const modeLabel =
         usedButtonMode === 'track+mod' ? 'Слушать трек + мод'
           : usedButtonMode === 'track' ? 'Слушать трек'
-            : 'без кнопок';
+            : usedButtonMode === 'mod' ? 'мод'
+              : 'без кнопок';
       log(
         'Кнопки Discord:',
         modeLabel,
@@ -1988,9 +2050,41 @@ let bridgeAutoState = {
 
 function enrichBridgeStatus(st) {
   const base = st && typeof st === 'object' ? st : { ok: false, installed: false };
+  const liveMs = clientBridgeFreshMs();
+  const bridgeLive =
+    lastClientBridgePostAt > 0 && Date.now() - lastClientBridgePostAt < liveMs;
+  const bridgeLiveAgeSec =
+    lastClientBridgePostAt > 0
+      ? Math.round((Date.now() - lastClientBridgePostAt) / 1000)
+      : null;
+  const ymAlive = (() => {
+    try { return isYandexMusicAlive(); } catch (_) { return false; }
+  })();
+  let health = 'unknown';
+  if (!base.ok && base.error && !base.asarPath) {
+    health = 'error';
+  } else if (base.installed && bridgeLive) {
+    health = 'ok';
+  } else if (base.installed && !bridgeLive) {
+    health = ymAlive ? 'installed_idle' : 'installed_offline';
+  } else if (!base.installed) {
+    health = 'missing';
+  }
   return {
     ...base,
     bridgeAutoInstall: runtimeConfig.bridgeAutoInstall !== false,
+    bridgeLive,
+    bridgeLiveAgeSec,
+    ymAlive,
+    activeSource: lastActiveSource,
+    health,
+    healthLabel:
+      health === 'ok' ? 'работает корректно'
+        : health === 'installed_idle' ? 'установлен, ждёт воспроизведение'
+          : health === 'installed_offline' ? 'установлен, Яндекс.Музыка не шлёт данные'
+            : health === 'missing' ? 'не установлен'
+              : health === 'error' ? 'ошибка проверки'
+                : 'неизвестно',
     auto: {
       ...bridgeAutoState,
       lastStatus: undefined, // не дублируем весь статус
@@ -2245,8 +2339,130 @@ function runPowerShellFile(scriptPath, timeoutMs = 15000) {
   });
 }
 
+/** Кэш: запущен ли процесс Яндекс.Музыки (Windows). */
+let ymProcessCache = { at: 0, running: null };
+/** Антидребезг параллельных clear от poller + watchdog. */
+let ymGoneClearInFlight = false;
+/** Поколение постов моста: clear не должен затирать более новый stamp. */
+let clientBridgePostEpoch = 0;
+
+function clientBridgeFreshMs() {
+  return Math.max(Number(runtimeConfig.desktopBrowserPriorityMs) || 12000, 15000);
+}
+
+function isClientBridgeFresh(now = Date.now()) {
+  const liveMs = clientBridgeFreshMs();
+  return lastClientBridgePostAt > 0 && now - lastClientBridgePostAt < liveMs;
+}
+
+/**
+ * Проверка процессов YM по пути установки (без кириллицы в фильтре имён —
+ * иначе Get-Process/'Яндекс Музыка' часто даёт ложный «закрыта»).
+ * @returns {boolean}
+ */
+function isYandexMusicProcessRunning() {
+  if (process.platform !== 'win32') return true;
+  const now = Date.now();
+  if (ymProcessCache.running != null && now - ymProcessCache.at < YM_PROCESS_CHECK_MS) {
+    return ymProcessCache.running;
+  }
+  let running = false;
+  try {
+    for (const name of ['Y.Music.exe', 'YandexMusic.exe']) {
+      const r = spawnSync('tasklist', ['/FI', `IMAGENAME eq ${name}`, '/NH'], {
+        encoding: 'utf8',
+        timeout: 2500,
+        windowsHide: true,
+      });
+      const out = `${r.stdout || ''}${r.stderr || ''}`;
+      if (out && !/no tasks|информац|info:/i.test(out) && out.toLowerCase().includes(name.toLowerCase())) {
+        running = true;
+        break;
+      }
+    }
+  } catch (_) {}
+  if (!running) {
+    try {
+      // Только клиент из …\YandexMusic\… — не наш «Yandex Music RPC».
+      const ps = [
+        "$ErrorActionPreference='SilentlyContinue'",
+        [
+          "$p = Get-CimInstance Win32_Process | Where-Object {",
+          "$_.Name -eq 'Y.Music.exe' -or $_.Name -eq 'YandexMusic.exe' -or",
+          "($_.ExecutablePath -and $_.ExecutablePath -match '[\\\\/]YandexMusic[\\\\/]' -and $_.ExecutablePath -notmatch 'discord-rpc|Yandex Music RPC')",
+          '} | Select-Object -First 1 -ExpandProperty ProcessId',
+        ].join(' '),
+        'if ($p) { Write-Output $p }',
+      ].join('; ');
+      const r = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
+        encoding: 'utf8',
+        timeout: 5000,
+        windowsHide: true,
+      });
+      if ((r.stdout || '').trim()) running = true;
+    } catch (_) {}
+  }
+  ymProcessCache = { at: now, running };
+  return running;
+}
+
+/**
+ * YM «жива», если процесс найден ИЛИ мост недавно прислал трек
+ * (мост = железобетонное доказательство, что клиент открыт).
+ * Не пишет в ymProcessCache — иначе grace моста «отравляет» кэш процесса.
+ */
+function isYandexMusicAlive() {
+  if (isClientBridgeFresh()) return true;
+  return isYandexMusicProcessRunning();
+}
+
+async function clearBecauseYandexMusicGone(reason) {
+  if (ymGoneClearInFlight) return;
+  if (isClientBridgeFresh()) return;
+  if (isYandexMusicProcessRunning()) return;
+
+  const hadPresence =
+    !presenceAlreadyClearedLocally() ||
+    Boolean(lastDesktopTrackKey) ||
+    lastActiveSource === 'client' ||
+    lastActiveSource === 'desktop';
+  if (!hadPresence && lastClientBridgePostAt <= 0) return;
+
+  const epochAtStart = clientBridgePostEpoch;
+  const stampAtStart = lastClientBridgePostAt;
+  ymGoneClearInFlight = true;
+  try {
+    // Повторная проверка перед clear (процесс мог «найтись», мост — успеть написать).
+    if (isClientBridgeFresh() || clientBridgePostEpoch !== epochAtStart) return;
+    if (isYandexMusicProcessRunning()) return;
+
+    // Таймеры гасим до await, иначе idle/pause могут снова поднять presence.
+    clearAllPresenceTimers();
+    await clearActivityAndResetTrackSession({ silent: false });
+
+    // Мост успел запостить во время clear — не затираем stamp/источник.
+    if (clientBridgePostEpoch !== epochAtStart || lastClientBridgePostAt > stampAtStart) {
+      return;
+    }
+    if (isClientBridgeFresh()) return;
+
+    lastDesktopTrackKey = null;
+    lastPrioritySourcePostAt = 0;
+    lastActiveSource = 'none';
+    lastNowPlaying = { title: '', artist: '' };
+    lastClientBridgePostAt = 0;
+    log('Статус сброшен:', reason || 'Яндекс.Музыка не запущена');
+  } finally {
+    ymGoneClearInFlight = false;
+  }
+}
+
 async function desktopPollOnce() {
   if (process.platform !== 'win32') return null;
+  // Нет живого YM (процесс / свежий мост) — GSMTC часто врёт «ещё играет».
+  if (!isYandexMusicAlive()) {
+    return { ok: false, ymGone: true };
+  }
   const gsmtcPath = getGsmtcScriptPath();
   if (fs.existsSync(gsmtcPath)) {
     const g = await runPowerShellFile(gsmtcPath);
@@ -2326,6 +2542,12 @@ function startDesktopPoller() {
     busy = true;
     busySinceMs = Date.now();
     try {
+      // Процесс закрыт — моментальный clear (не ждём idle 5 мин / resync 10с).
+      // Если мост только что писал — isYandexMusicAlive() = true, clear не делаем.
+      if (!isYandexMusicAlive()) {
+        await clearBecauseYandexMusicGone('Яндекс.Музыка закрыта');
+        return;
+      }
       const priorityFresh =
         Date.now() - Math.max(lastPrioritySourcePostAt, lastBrowserPostAt) <
         runtimeConfig.desktopBrowserPriorityMs;
@@ -2336,6 +2558,10 @@ function startDesktopPoller() {
       const shouldOwnDesktop =
         runtimeConfig.preferredSource === 'desktop' ||
         (runtimeConfig.preferredSource === 'auto' && !priorityFresh);
+      if (data && data.ymGone) {
+        await clearBecauseYandexMusicGone('Яндекс.Музыка не запущена');
+        return;
+      }
       if (!data || !data.ok) {
         if (shouldOwnDesktop && lastDesktopTrackKey) {
           lastDesktopTrackKey = null;
@@ -2375,6 +2601,13 @@ function startDesktopPoller() {
   const pollMs = Math.max(250, Number(runtimeConfig.desktopPollIntervalMs) || 500);
   setInterval(tick, pollMs);
   setTimeout(tick, 400);
+
+  // Отдельный сторож процесса: даже если desktop poller занят GSMTC/priority-мостом.
+  setInterval(() => {
+    if (process.platform !== 'win32') return;
+    if (isYandexMusicAlive()) return;
+    clearBecauseYandexMusicGone('Яндекс.Музыка закрыта').catch(() => {});
+  }, YM_PROCESS_CHECK_MS);
 }
 
 function runHttpServer() {
@@ -2417,10 +2650,10 @@ function runHttpServer() {
         port: HTTP_PORT,
         preferredSource: runtimeConfig.preferredSource,
         activeSource: lastActiveSource,
-        clientBridgeFresh:
-          Date.now() - lastPrioritySourcePostAt < runtimeConfig.desktopBrowserPriorityMs,
+        clientBridgeFresh: isClientBridgeFresh(),
         bridgeAutoInstall: runtimeConfig.bridgeAutoInstall !== false,
         bridgeInstalled: !!(bridgeAutoState.lastStatus && bridgeAutoState.lastStatus.installed),
+        bridgeLive: isClientBridgeFresh(),
         discordClientId: getActiveClientId(),
         discordClientIdSource: clientIdSource(runtimeConfig),
         discordClientIdBuiltin: BUILTIN_DISCORD_CLIENT_ID,
@@ -2431,12 +2664,16 @@ function runHttpServer() {
       }));
       return;
     }
-    if (req.method === 'GET' && (req.url === '/api/bridge' || req.url === '/api/bridge/status')) {
+    if (req.method === 'GET' && (req.url === '/api/bridge' || req.url === '/api/bridge/status' || req.url.startsWith('/api/bridge/status?'))) {
       (async () => {
         try {
           const st = await runBridgeCli(['--status']);
           bridgeAutoState.lastCheckAt = Date.now();
           bridgeAutoState.lastStatus = st;
+          // Мост мог «пропасть» после обновления Яндекс.Музыки — тихо вернём, если авто вкл.
+          if (st && st.ok && st.installed === false && runtimeConfig.bridgeAutoInstall !== false) {
+            ensureClientBridgeInstalled({ reason: 'status_missing' }).catch(() => {});
+          }
           res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
           res.end(JSON.stringify(enrichBridgeStatus(st)));
         } catch (e) {
@@ -2594,6 +2831,19 @@ function runHttpServer() {
           if (src === 'client' || src === 'browser' || src === 'web') {
             lastPrioritySourcePostAt = Date.now();
             lastBrowserPostAt = lastPrioritySourcePostAt;
+            if (src === 'client') {
+              lastClientBridgePostAt = lastPrioritySourcePostAt;
+              clientBridgePostEpoch += 1;
+              // Мягкий хинт на 1с кэша; «жива» определяется isClientBridgeFresh / процессом.
+              ymProcessCache = { at: Date.now(), running: true };
+            }
+          }
+          // Desktop без живого YM — игнор (GSMTC залипает).
+          if (src === 'desktop' && process.platform === 'win32' && !isYandexMusicAlive()) {
+            await clearBecauseYandexMusicGone('Яндекс.Музыка не запущена');
+            res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, cleared: true, reason: 'ym_not_running' }));
+            return;
           }
           // Мост в клиенте всегда принимаем (максимальная точность).
           // browser/web игнорируем только в режиме preferredSource=desktop.
@@ -2916,19 +3166,20 @@ function runHttpServer() {
                 Math.abs(raw - lastGsmtcRawPosSec) > 3.5;
 
               if (stale) {
-                // Если GSMTC залип на 0, а стенные часы ушли за длительность —
-                // симулируем повтор трека: позиция = остаток от деления (expectedSec % dur)
-                if (raw < 1 && dur > 0.5 && expectedSec > dur + 0.5) {
+                // На паузе / в конце трека НЕ симулируем loop — иначе RPC «переигрывает» последние секунды.
+                if (
+                  !msg.paused &&
+                  raw < 1 &&
+                  dur > 0.5 &&
+                  expectedSec > dur + 0.5
+                ) {
                   const loopPos = expectedSec % dur;
                   if (loopPos < 5) {
-                    // Только что пересекли границу цикла — форсируем апдейт Discord
                     gsmtcDidResetToStart = true;
                   }
                   posSec = loopPos;
                   currentTrackStart = now - posSec * 1000;
                 } else {
-                  // Раньше здесь подставляли expectedSec — Discord «играл сам» на паузе.
-                  // Оставляем сырую позицию и считаем это паузой/стопом.
                   posSec = raw;
                   gsmtcStalePaused = true;
                 }
@@ -2936,8 +3187,11 @@ function runHttpServer() {
                 currentTrackStart = now - raw * 1000;
                 posSec = dur > 0 ? Math.min(raw, dur) : raw;
                 timelineSeeked = true;
-                // Сброс позиции через seek (скачок > 3.5 сек) на начало — повтор трека
                 if (raw < dur - 10) gsmtcDidResetToStart = true;
+              } else if (dur > 0 && raw >= dur - 6) {
+                // У конца трека не крутим wall-clock — иначе «доигрывание» / повтор хвоста.
+                posSec = Math.min(raw, dur);
+                if (msg.paused) gsmtcStalePaused = true;
               } else {
                 posSec = dur > 0
                   ? Math.min(Math.max(0, expectedSec), dur)
@@ -2984,19 +3238,22 @@ function runHttpServer() {
             effectiveDurSec != null ? effectiveDurSec : durSec != null ? durSec : 0;
           let elapsedForDisplaySec = dForDisplay > 0 ? Math.min(pForDisplay, dForDisplay) : pForDisplay;
           const totalForDisplaySec = dForDisplay > 0 ? dForDisplay : Math.max(pForDisplay, dForDisplay);
+          // Реальный repeat: ушли с конца в начало. Не путать с залипанием на последних 3–5с.
           const cycleRestartDetected =
             !msg.paused &&
             totalForDisplaySec > 8 &&
             lastObservedTimelineKey === key &&
             typeof lastObservedElapsedSec === 'number' &&
             lastObservedElapsedSec >= totalForDisplaySec - 18 &&
-            elapsedForDisplaySec <= 5;
+            elapsedForDisplaySec <= 5 &&
+            elapsedForDisplaySec < lastObservedElapsedSec - 8;
           if (cycleRestartDetected && Number.isFinite(pForDisplay)) {
             currentTrackStart = now - pForDisplay * 1000;
             if (effectiveDurSec != null && Number.isFinite(effectiveDurSec)) {
               endsAtMs = currentTrackStart + effectiveDurSec * 1000;
             }
             lastDiscordTimelineAtEnd = false;
+            pausedClearBlockedTrackKey = null;
           }
           /*
            * Если по часам «уже после endsAtMs», а сырая позиция в начале трека — endsAtMs
@@ -3054,18 +3311,32 @@ function runHttpServer() {
           }
           const stuckLongEnough =
             positionStuckSinceMs != null && now - positionStuckSinceMs >= POSITION_STUCK_CLEAR_MS;
-          // Пауза / stale GSMTC — скрываем presence.
-          // Один только «залипший» таймкод mid-track НЕ скрываем: иначе статус не появляется,
-          // если трек уже играет не с 00:00, а позиция в мосте обновляется редко.
+          // Хвост трека (последние ~6с) без роста позиции — стоп/пауза в конце, не «доигрывание».
+          const nearTrackEnd =
+            totalForDisplaySec > 8 &&
+            elapsedForDisplaySec >= totalForDisplaySec - 6;
+          const endHoldPause =
+            nearTrackEnd &&
+            !positionAdvancing &&
+            (
+              Boolean(msg.paused) ||
+              stuckLongEnough ||
+              lastSentTrackKey === '__cleared_pause__' ||
+              lastDiscordTimelineAtEnd ||
+              pausedClearBlockedTrackKey === key
+            );
+          // Пауза / stale GSMTC / конец трека — скрываем presence.
           const pausedFlag =
             gsmtcStalePaused ||
             (Boolean(msg.paused) && !positionAdvancing) ||
-            (stuckLongEnough && Boolean(msg.paused));
+            stuckLongEnough ||
+            endHoldPause;
 
           if (pausedFlag) {
             if (pausedSinceMs == null) pausedSinceMs = now;
             const pauseConfirmed =
-              (stuckLongEnough && Boolean(msg.paused)) ||
+              stuckLongEnough ||
+              endHoldPause ||
               now - pausedSinceMs >= PAUSE_CONFIRM_MS;
             if (pauseConfirmed) {
               // Не показываем «Приостановлено» — просто убираем presence, чтобы не висел залипший тайм-бар.
@@ -3078,14 +3349,36 @@ function runHttpServer() {
                 lastDiscordActivityAt = now;
                 positionStuckSinceMs = null;
                 pausedSinceMs = now; // не спамим clearActivity
-                log('Статус скрыт: пауза (только актуальное воспроизведение)');
+                if (nearTrackEnd) {
+                  pausedClearBlockedTrackKey = key;
+                  lastDiscordTimelineAtEnd = true;
+                }
+                log(
+                  nearTrackEnd
+                    ? 'Статус скрыт: конец трека / пауза в хвосте'
+                    : 'Статус скрыт: пауза (только актуальное воспроизведение)',
+                );
               }
             }
             // Во время короткого мигания paused не трогаем Discord — полоска у клиента доживёт сама.
           } else {
             pausedSinceMs = null;
             positionStuckSinceMs = null;
-            pausedClearBlockedTrackKey = null;
+            // Не снимаем блокировку хвоста, пока тот же трек у конца без реального хода.
+            if (pausedClearBlockedTrackKey === key && nearTrackEnd && !positionAdvancing) {
+              // остаёмся «на паузе в конце» — не поднимаем playing снова
+              lastObservedTimelineKey = key || null;
+              lastObservedElapsedSec = elapsedForDisplaySec;
+              lastObservedWallMs = now;
+              res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, held: 'track_end_pause' }));
+              return;
+            }
+            if (pausedClearBlockedTrackKey === key && (!nearTrackEnd || positionAdvancing || cycleRestartDetected)) {
+              pausedClearBlockedTrackKey = null;
+            } else if (pausedClearBlockedTrackKey && pausedClearBlockedTrackKey !== key) {
+              pausedClearBlockedTrackKey = null;
+            }
             const presenceMissing =
               desiredPresence.kind !== 'playing' ||
               lastSentTrackKey === '__cleared_pause__' ||
@@ -3290,6 +3583,10 @@ async function main() {
   setTimeout(() => {
     ensureClientBridgeInstalled({ reason: 'startup' }).catch(() => {});
   }, 2500);
+  // Яндекс.Музыка иногда обновляет asar и сносит мост — периодически проверяем.
+  setInterval(() => {
+    ensureClientBridgeInstalled({ reason: 'periodic' }).catch(() => {});
+  }, 10 * 60 * 1000);
 
   setInterval(() => {
     if (!hasLoggedFirstMsg) {

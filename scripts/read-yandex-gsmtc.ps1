@@ -157,7 +157,8 @@ function Add-SessionEntry($session, [int]$baseRank) {
       Rank    = $r
       Session = $session
       Props   = $props
-      Paused  = ($st -eq $Paused)
+      # Всё, что не Playing (Paused/Stopped/Closed/…) — не «слушает».
+      Paused  = ($st -ne $Playing)
     })
 }
 

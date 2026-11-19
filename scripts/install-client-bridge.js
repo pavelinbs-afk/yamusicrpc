@@ -25,7 +25,7 @@ const fs = (() => {
 })();
 const path = require('path');
 const os = require('os');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const BRIDGE_FILE = 'ym-rpc-bridge.js';
 const HOOK_FILE = 'ym-rpc-hook.js';
@@ -301,7 +301,17 @@ function isPatchedAsar(asar, asarPath) {
   try {
     const pkgRaw = asar.extractFile(asarPath, 'package.json').toString('utf8');
     const pkg = JSON.parse(pkgRaw);
-    return pkg.main === './' + BOOTSTRAP_FILE || pkg.main === BOOTSTRAP_FILE;
+    const mainOk = pkg.main === './' + BOOTSTRAP_FILE || pkg.main === BOOTSTRAP_FILE;
+    if (!mainOk) return false;
+    // После обновления клиента main иногда ещё старый, иногда битый asar без файлов моста.
+    try {
+      asar.extractFile(asarPath, BOOTSTRAP_FILE);
+      asar.extractFile(asarPath, HOOK_FILE);
+      asar.extractFile(asarPath, BRIDGE_FILE);
+    } catch (_) {
+      return false;
+    }
+    return true;
   } catch (_) {
     return false;
   }
@@ -348,6 +358,7 @@ async function install(asarPath) {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
   }
 
+  const launched = launchYandexMusic(exePath);
   return {
     ok: true,
     asarPath,
@@ -357,7 +368,25 @@ async function install(asarPath) {
     installed: true,
     mode: 'asar+fuses',
     closedYandexMusic: closed,
+    launchedYandexMusic: launched,
   };
+}
+
+/** Запуск клиента после установки моста (asar уже перезаписан). */
+function launchYandexMusic(exePath) {
+  if (!exePath || !fs.existsSync(exePath)) return false;
+  try {
+    sleepMs(600);
+    const child = spawn(exePath, [], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false,
+    });
+    child.unref();
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 async function uninstall(asarPath) {
@@ -490,8 +519,13 @@ async function main() {
     process.exit(0);
   }
 
-  console.log(JSON.stringify(await install(asarPath), null, 2));
-  console.log('Мост установлен. Запустите Яндекс.Музыку и Yandex Music RPC.');
+  const installed = await install(asarPath);
+  console.log(JSON.stringify(installed, null, 2));
+  if (installed && installed.launchedYandexMusic) {
+    console.log('Мост установлен. Яндекс.Музыка запущена.');
+  } else {
+    console.log('Мост установлен. Запустите Яндекс.Музыку и Yandex Music RPC.');
+  }
 }
 
 if (require.main === module) {
@@ -504,6 +538,7 @@ if (require.main === module) {
 module.exports = {
   resolveAsarPath,
   forceCloseYandexMusic,
+  launchYandexMusic,
   install,
   uninstall,
   status,

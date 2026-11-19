@@ -269,11 +269,12 @@
         Мост ставится сам при установке программы (.exe / .msi) и при запуске RPC
         (в т.ч. portable), если его ещё нет. Перед записью asar
         <strong>принудительно закрывается Яндекс.Музыка</strong>.
+        «Установлен» ≠ «работает»: если источник GSMTC — перезапустите Яндекс.Музыку.
         Удаление отключает автоустановку, чтобы мост не вернулся при следующем старте.
       </p>
       <div class="actions">
         <button type="button" class="primary" id="btn-bridge-install">Установить</button>
-        <button type="button" class="ghost" id="btn-bridge-uninstall">Удалить мост</button>
+        <button type="button" class="ghost" id="btn-bridge-uninstall" style="display:none">Удалить мост</button>
         <button type="button" class="ghost" id="btn-bridge-refresh">Проверить</button>
       </div>
     </section>
@@ -290,12 +291,12 @@
       </p>
 
       <label class="row row-toggle" style="margin-top:16px">
-        <span>Пробовать кнопки вместе с тайм-баром</span>
-        <input type="checkbox" class="checkbox-lg" id="discord-try-buttons-timeline" />
+        <span>Кнопка «Слушать трек»</span>
+        <input type="checkbox" class="checkbox-lg" id="discord-show-track-btn" />
       </label>
       <p class="hint">
-        Сначала шлём Listening + тайм-бар + кнопки. Если Discord отклонит — останется тайм-бар без кнопок
-        (статус важнее). У BetaMod кнопки с тайм-баром иногда работают на своём Application ID.
+        Показывать в Discord кнопку со ссылкой на текущий трек. Независимо от кнопки мода.
+        Вместе с тайм-баром; если Discord отклонит комбинацию — останется тайм-бар без кнопок.
       </p>
 
       <p class="hint" style="margin-top:16px">
@@ -303,13 +304,11 @@
       </p>
 
       <label class="row row-toggle" style="margin-top:16px">
-        <span>Вторая кнопка (ссылка на мод)</span>
+        <span>Кнопка «Яндекс Музыка RPC»</span>
         <input type="checkbox" class="checkbox-lg" id="discord-show-mod-btn" />
       </label>
       <p class="hint">
-        По умолчанию в Discord — «Слушать трек». Если включено: RPC дополнительно
-        пытается отправить вторую кнопку (мод), не заменяя и не убирая первую.
-        При отказе Discord останется только «Слушать трек».
+        Кнопка со ссылкой на проект. Можно включить вместе со «Слушать трек» или отдельно.
       </p>
 
       <label class="row" style="margin-top:16px"><span>Discord Application ID</span></label>
@@ -325,7 +324,7 @@
       <p class="hint" id="discord-client-id-hint">
         Выберите один из основных ID или укажите свой из
         <a href="https://discord.com/developers/applications" target="_blank" rel="noopener noreferrer">Discord Developer Portal</a>.
-        По умолчанию — «Основной». Переменная DISCORD_RPC_CLIENT_ID имеет приоритет над этим полем.
+        По умолчанию — «Основной». Указанный ID имеет приоритет над этим полем (основным или альтернативой).
       </p>
       <div class="actions" style="margin-top:8px">
         <button type="button" class="primary" id="btn-save-discord-id">Сохранить Application ID</button>
@@ -481,7 +480,9 @@
           '<strong>Discord:</strong> ' + (j.discordConnected ? 'подключён' : 'нет соединения') + '<br/>' +
           '<strong>Состояние RPC:</strong> ' + (j.rpcEnabled ? 'Включен' : 'Выключен') + '<br/>' +
           '<strong>Источник трека:</strong> ' + srcLabel +
-            (j.clientBridgeFresh ? ' (мост активен)' : '') + '<br/>' +
+            (j.clientBridgeFresh || j.bridgeLive
+              ? ' (мост активен)'
+              : (j.bridgeInstalled ? ' (мост в asar есть, но не шлёт данные)' : '')) + '<br/>' +
           '<strong>Application ID:</strong> ' + (j.discordClientId || '—') +
             (j.discordClientIdSource ? ' (' + (
               j.discordClientIdSource === 'env' ? 'из переменной окружения' :
@@ -571,8 +572,11 @@
     function fillForm(cfg, activeDiscordId) {
       $('rpc-enabled').checked = cfg.rpcEnabled !== false;
       $('discord-show-mod-btn').checked = cfg.discordShowModButton === true;
-      if ($('discord-try-buttons-timeline')) {
-        $('discord-try-buttons-timeline').checked = cfg.discordTryButtonsWithTimeline !== false;
+      if ($('discord-show-track-btn')) {
+        const trackOn = cfg.discordShowTrackButton != null
+          ? cfg.discordShowTrackButton !== false
+          : cfg.discordTryButtonsWithTimeline !== false;
+        $('discord-show-track-btn').checked = trackOn;
       }
       if ($('bridge-auto-install')) {
         $('bridge-auto-install').checked = cfg.bridgeAutoInstall !== false;
@@ -646,18 +650,21 @@
     $('btn-min-to-tray').addEventListener('click', sendToTray);
     $('btn-close-app').addEventListener('click', quitApp);
     function saveDiscordToggles() {
+      const showTrack = $('discord-show-track-btn')
+        ? $('discord-show-track-btn').checked
+        : true;
       savePartial({
         rpcEnabled: $('rpc-enabled').checked,
         discordShowModButton: $('discord-show-mod-btn').checked,
-        discordTryButtonsWithTimeline: $('discord-try-buttons-timeline')
-          ? $('discord-try-buttons-timeline').checked
-          : true,
+        discordShowTrackButton: showTrack,
+        // совместимость со старым ключом
+        discordTryButtonsWithTimeline: showTrack,
       });
     }
     $('rpc-enabled').addEventListener('change', saveDiscordToggles);
     $('discord-show-mod-btn').addEventListener('change', saveDiscordToggles);
-    if ($('discord-try-buttons-timeline')) {
-      $('discord-try-buttons-timeline').addEventListener('change', saveDiscordToggles);
+    if ($('discord-show-track-btn')) {
+      $('discord-show-track-btn').addEventListener('change', saveDiscordToggles);
     }
     async function saveDiscordClientId() {
       const sel = $('discord-client-id-preset');
@@ -713,16 +720,44 @@
     });
     $('btn-fetch-logs').addEventListener('click', fetchLogs);
 
-    async function fetchBridgeStatus() {
+    function updateBridgeButtons(j) {
+      const installed = !!(j && j.installed);
+      const btnInstall = $('btn-bridge-install');
+      const btnUninstall = $('btn-bridge-uninstall');
+      if (btnInstall) btnInstall.style.display = installed ? 'none' : '';
+      if (btnUninstall) btnUninstall.style.display = installed ? '' : 'none';
+    }
+
+    function bridgeStatusSummary(j) {
+      if (!j) return 'Не удалось проверить мост.';
+      if (!j.ok && j.error && !j.asarPath) {
+        return 'Ошибка: ' + j.error;
+      }
+      const health = j.healthLabel || (j.installed ? 'установлен' : 'не установлен');
+      const live = j.bridgeLive
+        ? 'данные с моста приходят'
+        : (j.installed
+          ? (j.ymAlive || j.health === 'installed_idle'
+            ? 'мост в asar есть; сейчас нет активного трека (пауза / стоп) — это нормально'
+            : 'в asar есть, но данные не приходят — откройте Яндекс.Музыку и включите трек')
+          : 'нужна установка');
+      return 'Проверка моста: ' + health + '.\n' + live + '.';
+    }
+
+    async function fetchBridgeStatus(opts) {
+      const notify = opts && opts.notify === true;
       const el = $('bridge-status-hint');
+      if (notify) el.textContent = 'Проверяю мост…';
       try {
         const r = await fetch(API + '/api/bridge/status');
         const j = await r.json();
         if ($('bridge-auto-install') && typeof j.bridgeAutoInstall === 'boolean') {
           $('bridge-auto-install').checked = j.bridgeAutoInstall;
         }
+        updateBridgeButtons(j);
         if (!j.ok && j.error && !j.asarPath) {
           el.innerHTML = '<strong>Мост:</strong> ' + j.error;
+          if (notify) alert(bridgeStatusSummary(j));
           return j;
         }
         const autoOn = j.bridgeAutoInstall !== false;
@@ -733,26 +768,44 @@
           j.auto && j.auto.lastAutoError
             ? '<br/><strong>Последняя ошибка авто:</strong> ' + j.auto.lastAutoError
             : '';
+        const healthLine = j.healthLabel
+          ? '<br/><strong>Состояние:</strong> ' + j.healthLabel
+          : '';
+        const liveLine = j.installed
+          ? (j.bridgeLive
+            ? '<br/><strong>Данные:</strong> мост активен (шлёт трек)'
+            : (j.ymAlive || j.health === 'installed_idle'
+              ? '<br/><strong>Данные:</strong> нет активного трека (пауза/стоп) — включите воспроизведение'
+              : '<br/><strong>Данные:</strong> не приходят — сейчас ' +
+                (j.activeSource === 'desktop' ? 'GSMTC / заголовок' : (j.activeSource || 'нет')) +
+                '. Откройте Яндекс.Музыку и включите трек.'))
+          : '';
         if (j.installed) {
           el.innerHTML =
             '<strong>Мост:</strong> установлен' +
             (j.mode ? ' (' + j.mode + ')' : '') +
             (j.backupPresent ? ', есть бэкап' : '') +
+            healthLine +
+            liveLine +
             '<br/><strong>' + autoLine + '</strong>' +
             (j.asarPath ? '<br/><span style="word-break:break-all">' + j.asarPath + '</span>' : '') +
             autoErr;
         } else {
           el.innerHTML =
             '<strong>Мост:</strong> не установлен' +
+            healthLine +
             '<br/><strong>' + autoLine + '</strong>' +
             (j.asarPath
               ? '<br/>Клиент найден — можно установить'
               : '<br/>Клиент Яндекс.Музыки не найден') +
             autoErr;
         }
+        if (notify) alert(bridgeStatusSummary(j));
         return j;
       } catch (e) {
         el.textContent = 'Не удалось проверить мост: ' + String(e);
+        updateBridgeButtons({ installed: false });
+        if (notify) alert('Не удалось проверить мост:\n' + String(e));
         return null;
       }
     }
@@ -774,7 +827,9 @@
           alert(
             path.indexOf('uninstall') >= 0
               ? 'Мост удалён. Автоустановка отключена. Перезапустите Яндекс.Музыку.'
-              : 'Мост установлен. Полностью перезапустите Яндекс.Музыку.',
+              : (j.launchedYandexMusic
+                ? 'Мост установлен. Яндекс.Музыка запущена.'
+                : 'Мост установлен. Запустите Яндекс.Музыку.'),
           );
         }
       } catch (e) {
@@ -796,7 +851,7 @@
         'Удалить мост из Яндекс.Музыки?\n\nЯндекс.Музыка будет закрыта. Автоустановка отключится.',
       ),
     );
-    $('btn-bridge-refresh').addEventListener('click', fetchBridgeStatus);
+    $('btn-bridge-refresh').addEventListener('click', () => fetchBridgeStatus({ notify: true }));
     if ($('bridge-auto-install')) {
       $('bridge-auto-install').addEventListener('change', () => {
         savePartial({ bridgeAutoInstall: $('bridge-auto-install').checked }).then(() => {

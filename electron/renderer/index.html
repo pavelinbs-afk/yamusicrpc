@@ -266,11 +266,11 @@
         <input type="checkbox" class="checkbox-lg" id="bridge-auto-install" />
       </label>
       <p class="hint">
-        С YM&nbsp;5.128 мост работает через CDP: ставится ярлык
-        <strong>«Яндекс Музыка (RPC)»</strong> с&nbsp;<code>--remote-debugging-port=9229</code>
-        (без правки app.asar). При старте RPC клиент открывается сам через этот ярлык,
-        если ещё не запущен. Обычный ярлык Яндекс.Музыки — без моста (останется GSMTC).
-        Удаление снимает ярлык/launcher и отключает автоустановку.
+        С YM&nbsp;5.128 мост — через CDP (замена asar): на столе ярлык
+        <strong>«Яндекс.Музыка для Discord»</strong> (плеер с&nbsp;<code>--remote-debugging-port=9229</code>).
+        Не путать с ярлыком <strong>Yandex Music RPC</strong> — это само приложение статуса.
+        При старте RPC плеер с портом открывается сам, если ещё не запущен.
+        Обычный ярлык Яндекс.Музыки — без моста (GSMTC). Удаление снимает ярлык плеера/launcher.
       </p>
       <div class="actions">
         <button type="button" class="primary" id="btn-bridge-install">Установить</button>
@@ -739,7 +739,7 @@
         : (j.installed
           ? (j.ymAlive || j.health === 'installed_idle'
             ? 'ярлык CDP есть; нет активного трека или клиент запущен без порта 9229'
-            : 'ярлык есть, но CDP молчит — закройте Яндекс.Музыку и откройте через «Яндекс Музыка (RPC)»')
+            : 'ярлык есть, но CDP молчит — закройте Яндекс.Музыку и откройте через «Яндекс.Музыка для Discord»')
           : 'нужна установка');
       return 'Проверка моста: ' + health + '.\n' + live + '.';
     }
@@ -827,7 +827,7 @@
           alert(
             path.indexOf('uninstall') >= 0
               ? 'Мост удалён. Автоустановка отключена.'
-              : 'Мост CDP установлен. Запускайте клиент ярлыком «Яндекс Музыка (RPC)» на рабочем столе.',
+              : 'Мост CDP установлен. Плеер: ярлык «Яндекс.Музыка для Discord». Приложение статуса: «Yandex Music RPC».',
           );
         }
       } catch (e) {
@@ -840,7 +840,7 @@
     $('btn-bridge-install').addEventListener('click', () =>
       runBridgeAction(
         '/api/bridge/install',
-        'Установить мост CDP?\n\nБудет создан ярлык «Яндекс Музыка (RPC)» с портом отладки 9229.\nСтарый asar-патч (если был) снимается.',
+        'Установить мост CDP?\n\nНа рабочий стол: «Яндекс.Музыка для Discord» (плеер с портом 9229) и при необходимости «Yandex Music RPC».\nСтарый asar-патч (если был) снимается.',
       ),
     );
     $('btn-bridge-uninstall').addEventListener('click', () =>

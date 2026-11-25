@@ -2065,12 +2065,8 @@ async function launchYandexMusicForRpc() {
   if (process.platform !== 'win32') {
     return { ok: false, launchedYandexMusic: false, error: 'not_windows' };
   }
-  try {
-    await refreshYandexMusicProcessRunning();
-  } catch (_) {}
-  if (isYandexMusicProcessRunning()) {
-    return { ok: true, launchedYandexMusic: false, alreadyRunning: true };
-  }
+  // Не опираемся на optimistic-кэш процессов (null → «уже запущена»).
+  // Решает install-client-bridge --launch-if-needed (CDP / CIM / Start-Process).
   try {
     return await runBridgeCli(['--launch-if-needed']);
   } catch (e) {

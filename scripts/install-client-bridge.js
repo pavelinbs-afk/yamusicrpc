@@ -166,8 +166,64 @@ function restoreLegacyAsarPatch(asarPath) {
   return restored;
 }
 
+/** Ярлык официальной Музыки с CDP — не путать с приложением Yandex Music RPC. */
 function desktopShortcutPath() {
-  return path.join(os.homedir(), 'Desktop', 'Яндекс Музыка (RPC).lnk');
+  return path.join(os.homedir(), 'Desktop', 'Яндекс.Музыка для Discord.lnk');
+}
+
+/** Старое имя ярлыка моста (путалось с Yandex Music RPC). */
+function legacyDesktopShortcutPaths() {
+  return [
+    path.join(os.homedir(), 'Desktop', 'Яндекс Музыка (RPC).lnk'),
+    path.join(os.homedir(), 'Desktop', 'Яндекс Музыка (RPC bridge).lnk'),
+  ];
+}
+
+function rpcAppDesktopShortcutPath() {
+  return path.join(os.homedir(), 'Desktop', 'Yandex Music RPC.lnk');
+}
+
+function findRpcAppExe() {
+  if (process.platform === 'win32' && process.execPath) {
+    const base = path.basename(process.execPath);
+    if (/^Yandex Music RPC\.exe$/i.test(base) && fs.existsSync(process.execPath)) {
+      return process.execPath;
+    }
+  }
+  const local = process.env.LOCALAPPDATA || '';
+  if (local) {
+    const p = path.join(local, 'Programs', 'yandex-music-discord-rpc', 'Yandex Music RPC.exe');
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+/** Ярлык самого приложения Discord RPC на рабочий стол. */
+function createRpcAppDesktopShortcut() {
+  if (process.platform !== 'win32') return null;
+  const exePath = findRpcAppExe();
+  if (!exePath) return null;
+  const lnk = rpcAppDesktopShortcutPath();
+  const ps =
+    `$ws = New-Object -ComObject WScript.Shell\n` +
+    `$s = $ws.CreateShortcut('${lnk.replace(/'/g, "''")}')\n` +
+    `$s.TargetPath = '${String(exePath).replace(/'/g, "''")}'\n` +
+    `$s.WorkingDirectory = '${path.dirname(exePath).replace(/'/g, "''")}'\n` +
+    `$s.IconLocation = '${String(exePath).replace(/'/g, "''")},0'\n` +
+    `$s.Description = 'Yandex Music RPC — статус в Discord'\n` +
+    `$s.Save()\n` +
+    `Write-Output 'ok'`;
+  const r = runPowerShellEncoded(ps, 20000);
+  if (r.status !== 0) return null;
+  return lnk;
+}
+
+function removeLegacyYmRpcShortcuts() {
+  for (const p of legacyDesktopShortcutPaths()) {
+    try {
+      if (fs.existsSync(p)) fs.unlinkSync(p);
+    } catch (_) {}
+  }
 }
 
 /** Есть ли уже процесс клиента (не наш RPC). */
@@ -196,12 +252,15 @@ function isCdpPortOpen() {
 /**
  * Запуск клиента с --remote-debugging-port (как ярлык «Яндекс Музыка (RPC)»).
  * Кириллический путь — только через PowerShell EncodedCommand.
+ * Важно: сбросить ELECTRON_RUN_AS_NODE — иначе YM наследует флаг от RPC-cli и не открывает GUI.
  */
 function launchYandexMusic(exePath) {
   if (!exePath || !fs.existsSync(exePath)) return false;
   const exeLit = String(exePath).replace(/'/g, "''");
   const dirLit = path.dirname(exePath).replace(/'/g, "''");
   const ps =
+    "Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; " +
+    "Remove-Item Env:ELECTRON_NO_ASAR -ErrorAction SilentlyContinue; " +
     "$ErrorActionPreference='Stop'; " +
     `Start-Process -FilePath '${exeLit}' -WorkingDirectory '${dirLit}' ` +
     `-ArgumentList '--remote-debugging-port=${CDP_PORT}'`;
@@ -254,6 +313,8 @@ function writeLauncher(exePath) {
   const cmdPath = launcherCmdPath();
   // .ps1 с BOM — кириллический путь exe не ломается.
   const ps1 =
+    'Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue\r\n' +
+    'Remove-Item Env:ELECTRON_NO_ASAR -ErrorAction SilentlyContinue\r\n' +
     '$ErrorActionPreference = \'Stop\'\r\n' +
     `$exe = '${String(exePath).replace(/'/g, "''")}'\r\n` +
     `$wd = '${path.dirname(exePath).replace(/'/g, "''")}'\r\n` +
@@ -295,7 +356,7 @@ function createDesktopShortcut(exePath) {
     `$s.Arguments = '--remote-debugging-port=${CDP_PORT}'\n` +
     `$s.WorkingDirectory = '${path.dirname(exePath).replace(/'/g, "''")}'\n` +
     `$s.IconLocation = '${String(exePath).replace(/'/g, "''")},0'\n` +
-    `$s.Description = 'Yandex Music + Discord RPC (CDP)'\n` +
+  `$s.Description = 'Официальная Яндекс.Музыка с портом для Yandex Music RPC'\n` +
     `$s.Save()\n` +
     `Write-Output 'ok'`;
   const r = runPowerShellEncoded(ps, 20000);
@@ -314,7 +375,9 @@ function install(asarPath) {
 
   const legacy = restoreLegacyAsarPatch(asarPath);
   const launcher = writeLauncher(exePath);
+  removeLegacyYmRpcShortcuts();
   const shortcut = createDesktopShortcut(exePath);
+  const rpcShortcut = createRpcAppDesktopShortcut();
 
   return {
     ok: true,
@@ -325,10 +388,11 @@ function install(asarPath) {
     exePath,
     launcher,
     shortcut,
+    rpcShortcut,
     legacyRestored: legacy,
     message:
-      'Мост CDP установлен. Запускайте Яндекс.Музыку через ярлык «Яндекс Музыка (RPC)» ' +
-      `на рабочем столе (порт ${CDP_PORT}). Обычный ярлык клиента — без моста.`,
+      'Мост CDP установлен. На рабочем столе: «Yandex Music RPC» (это приложение) и ' +
+      `«Яндекс.Музыка для Discord» (плеер с портом ${CDP_PORT}).`,
   };
 }
 
@@ -343,13 +407,14 @@ function uninstall(asarPath) {
       }
     } catch (_) {}
   }
-  const desk = desktopShortcutPath();
-  try {
-    if (fs.existsSync(desk)) {
-      fs.unlinkSync(desk);
-      removed.push(desk);
-    }
-  } catch (_) {}
+  for (const desk of [desktopShortcutPath(), ...legacyDesktopShortcutPaths()]) {
+    try {
+      if (fs.existsSync(desk)) {
+        fs.unlinkSync(desk);
+        removed.push(desk);
+      }
+    } catch (_) {}
+  }
   return {
     ok: true,
     installed: false,
@@ -456,6 +521,8 @@ module.exports = {
   launcherCmdPath,
   launcherPs1Path,
   desktopShortcutPath,
+  rpcAppDesktopShortcutPath,
+  createRpcAppDesktopShortcut,
   launchYandexMusic,
   launchYandexMusicIfNeeded,
   restoreLegacyAsarPatch,

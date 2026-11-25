@@ -42,12 +42,15 @@ function createSettingsWindow() {
     maxHeight: 820,
     show: false,
     frame: false,
+    backgroundColor: '#0e0e10',
     title: ver ? `Yandex Music RPC v${ver}` : 'Yandex Music RPC',
     titleBarStyle: 'hidden',
     skipTaskbar: false,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: false,
+      backgroundThrottling: false,
       preload: path.join(__dirname, 'preload.js'),
     },
   };
@@ -62,10 +65,42 @@ function createSettingsWindow() {
     }
   });
 
-  settingsWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
-  settingsWindow.once('ready-to-show', () => {
-    settingsWindow.show();
+  const htmlPath = path.join(__dirname, 'renderer', 'index.html');
+  const wc = settingsWindow.webContents;
+  wc.on('did-fail-load', (_e, code, desc, url) => {
+    try {
+      console.error('settings did-fail-load', code, desc, url);
+    } catch (_) {}
+    setTimeout(() => {
+      if (settingsWindow && !settingsWindow.isDestroyed()) {
+        try { wc.reload(); } catch (_) {}
+      }
+    }, 500);
   });
+  wc.on('render-process-gone', (_e, details) => {
+    try {
+      console.error('settings render-process-gone', details && details.reason, details && details.exitCode);
+    } catch (_) {}
+    setTimeout(() => {
+      if (settingsWindow && !settingsWindow.isDestroyed()) {
+        try { wc.reload(); } catch (_) {}
+      }
+    }, 800);
+  });
+  settingsWindow.loadFile(htmlPath).catch((err) => {
+    try {
+      console.error('settings window loadFile failed:', err && err.message ? err.message : err);
+    } catch (_) {}
+  });
+  settingsWindow.once('ready-to-show', () => {
+    if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.show();
+  });
+  // Если ready-to-show не пришёл — всё равно показать через 1.5с.
+  setTimeout(() => {
+    if (settingsWindow && !settingsWindow.isDestroyed() && !settingsWindow.isVisible()) {
+      settingsWindow.show();
+    }
+  }, 1500);
   settingsWindow.on('closed', () => {
     settingsWindow = null;
   });

@@ -1,7 +1,7 @@
 /**
- * Тонкий мост: читает плеер Яндекс.Музыки в renderer.
- * Отправку в RPC делает ym-rpc-hook.js из main process (Node http) —
- * так обходим CSP, который блокирует fetch на 127.0.0.1 из страницы.
+ * Тонкий мост: читает плеер Яндекс.Музыки в renderer (window.__ymRpcReadPlayer).
+ * Актуальный путь: RPC инжектит этот файл через CDP и забирает данные
+ * Runtime.evaluate (lib/cdp-bridge.js). Legacy: ym-rpc-hook.js в main process.
  */
 (function ymRpcBridge() {
   'use strict';

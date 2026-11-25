@@ -2,18 +2,19 @@
 'use strict';
 
 /**
- * Мост RPC → Яндекс.Музыка.
+ * Мост RPC → Яндекс.Музыка через CDP (Chrome DevTools Protocol).
  *
- * У Яндекс.Музыки в exe включена asar integrity: простая перезапись app.asar
- * ломает запуск. Поэтому установщик:
- *  1) бэкапит exe + app.asar
- *  2) отключает Fuse EnableEmbeddedAsarIntegrityValidation / OnlyLoadAppFromAsar
- *  3) патчит app.asar (bootstrap + hook + bridge), не трогая оригинальный index.js
+ * YM 5.128+: правка app.asar / flip Electron fuses ломает music-application://desktop
+ * (ERR_FAILED −2, бесконечный relaunch). Поэтому:
+ *  1) снимаем старый asar+fuses патч если был;
+ *  2) ставим ярлык/launcher с --remote-debugging-port=9229;
+ *  3) RPC читает плеер через CDP и шлёт source=client на /track.
  *
  * Usage:
  *   node scripts/install-client-bridge.js
  *   node scripts/install-client-bridge.js --uninstall
  *   node scripts/install-client-bridge.js --status
+ *   node scripts/install-client-bridge.js --launch-if-needed
  */
 
 const fs = (() => {
@@ -25,40 +26,16 @@ const fs = (() => {
 })();
 const path = require('path');
 const os = require('os');
-const { spawn, spawnSync } = require('child_process');
+const { spawnSync } = require('child_process');
 
-const BRIDGE_FILE = 'ym-rpc-bridge.js';
-const HOOK_FILE = 'ym-rpc-hook.js';
-const BOOTSTRAP_FILE = 'ym-rpc-bootstrap.js';
+const CDP_PORT = 9229;
 const BAK_ASAR = '.bak-ymrpc';
 const BAK_EXE = '.bak-ymrpc';
 const FUSES_MARK = '.ymrpc-fuses';
+const MARKER_FILE = '.ymrpc-cdp-bridge';
 
 function uniq(arr) {
   return [...new Set(arr.filter(Boolean))];
-}
-
-function candidateBridgeDirs() {
-  const dirs = [];
-  if (process.env.YM_RPC_BRIDGE_DIR) dirs.push(process.env.YM_RPC_BRIDGE_DIR);
-  dirs.push(path.join(__dirname, '..', 'client-bridge'));
-  dirs.push(path.join(__dirname, 'client-bridge'));
-  if (process.resourcesPath) {
-    dirs.push(path.join(process.resourcesPath, 'client-bridge'));
-    dirs.push(path.join(process.resourcesPath, 'app.asar.unpacked', 'client-bridge'));
-  }
-  try {
-    dirs.push(path.join(path.dirname(process.execPath), 'resources', 'client-bridge'));
-  } catch (_) {}
-  return uniq(dirs);
-}
-
-function resolveBridgeFile(filename) {
-  for (const dir of candidateBridgeDirs()) {
-    const p = path.join(dir, filename);
-    if (fs.existsSync(p)) return p;
-  }
-  throw new Error('Нет файла моста: ' + filename + ' (ожидался в client-bridge/)');
 }
 
 function candidateAsarPaths() {
@@ -83,32 +60,6 @@ function candidateAsarPaths() {
   return out;
 }
 
-function findYandexMusicExeDirs() {
-  if (process.platform !== 'win32') return [];
-  const ps = [
-    "$ErrorActionPreference='SilentlyContinue'",
-    "$names = @('Y.Music.exe','YandexMusic.exe','Яндекс Музыка.exe')",
-    '$dirs = New-Object System.Collections.Generic.HashSet[string]',
-    'foreach ($n in $names) {',
-    '  Get-Process | Where-Object { $_.Path } | ForEach-Object {',
-    '    try {',
-    '      $leaf = [IO.Path]::GetFileName($_.Path)',
-    '      if ($names -contains $leaf) { [void]$dirs.Add([IO.Path]::GetDirectoryName($_.Path)) }',
-    '    } catch {}',
-    '  }',
-    '}',
-    '$dirs | ForEach-Object { $_ }',
-  ].join('\n');
-  try {
-    const r = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
-      encoding: 'utf8', timeout: 20000, windowsHide: true,
-    });
-    return (r.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  } catch (_) {
-    return [];
-  }
-}
-
 function resolveAsarPath(explicit) {
   if (explicit) {
     const p = path.resolve(explicit);
@@ -118,297 +69,46 @@ function resolveAsarPath(explicit) {
   for (const p of candidateAsarPaths()) {
     if (fs.existsSync(p)) return p;
   }
-  for (const dir of findYandexMusicExeDirs()) {
-    const a = path.join(dir, 'resources', 'app.asar');
-    if (fs.existsSync(a)) return a;
-  }
-  return null;
+  throw new Error('Не найден app.asar Яндекс.Музыки');
 }
 
 function findYandexExe(asarPath) {
-  const root = path.dirname(path.dirname(asarPath)); // .../YandexMusic
-  const preferred = ['Яндекс Музыка.exe', 'Y.Music.exe', 'YandexMusic.exe', 'Yandex Music.exe'];
-  for (const name of preferred) {
-    const p = path.join(root, name);
+  const dir = path.dirname(path.dirname(asarPath));
+  const names = ['Яндекс Музыка.exe', 'YandexMusic.exe', 'Y.Music.exe', 'Yandex Music.exe'];
+  for (const n of names) {
+    const p = path.join(dir, n);
     if (fs.existsSync(p)) return p;
   }
   try {
-    const names = fs.readdirSync(root);
-    for (const n of names) {
-      if (!/\.exe$/i.test(n)) continue;
-      if (/uninstall|elevate|update|crash|helper|proxy/i.test(n)) continue;
-      return path.join(root, n);
-    }
-  } catch (_) {}
-  return null;
-}
-
-function isYandexMusicExeRunning() {
-  if (process.platform !== 'win32') return false;
-  // CIM по пути установки — надёжнее tasklist с кириллическим IMAGENAME.
-  try {
-    const ps =
-      "$ErrorActionPreference='SilentlyContinue'; " +
-      "$p = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -match '[\\\\/]YandexMusic[\\\\/]') -and ($_.ExecutablePath -notmatch 'discord-rpc|Yandex Music RPC') } | Select-Object -First 1 -ExpandProperty ProcessId; " +
-      'if ($p) { Write-Output $p }';
-    const b64 = Buffer.from(ps, 'utf16le').toString('base64');
-    const r = spawnSync(
-      'powershell',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64],
-      { encoding: 'utf8', timeout: 8000, windowsHide: true },
+    const hit = fs.readdirSync(dir).find(
+      (n) => /\.exe$/i.test(n) && !/uninstall|elevate|update/i.test(n),
     );
-    if ((r.stdout || '').trim()) return true;
-  } catch (_) {}
-  const images = ['Y.Music.exe', 'YandexMusic.exe', 'Яндекс Музыка.exe'];
-  for (const img of images) {
-    try {
-      const r = spawnSync('tasklist', ['/FI', `IMAGENAME eq ${img}`, '/NH'], {
-        encoding: 'utf8',
-        timeout: 2500,
-        windowsHide: true,
-      });
-      const out = `${r.stdout || ''}${r.stderr || ''}`;
-      if (out && !/no tasks|информац|info:/i.test(out) && out.toLowerCase().includes(img.toLowerCase())) {
-        return true;
-      }
-    } catch (_) {}
-  }
-  return false;
-}
-
-function sleepMs(ms) {
-  const wait = Math.max(0, ms | 0);
-  if (process.platform === 'win32') {
-    try {
-      spawnSync(
-        'powershell',
-        ['-NoProfile', '-Command', `Start-Sleep -Milliseconds ${wait}`],
-        { timeout: wait + 5000, windowsHide: true, stdio: 'ignore' },
-      );
-      return;
-    } catch (_) {}
-  }
-  const end = Date.now() + wait;
-  while (Date.now() < end) {
-    /* spin */
-  }
-}
-
-/**
- * Принудительно завершает процессы Яндекс.Музыки, чтобы отпустить app.asar / exe.
- * @param {string|null} asarPath
- * @returns {{ killed: number, methods: string[] }}
- */
-function forceCloseYandexMusic(asarPath) {
-  if (process.platform !== 'win32') {
-    return { killed: 0, methods: [] };
-  }
-  const methods = [];
-  let killed = 0;
-  const installRoot = asarPath
-    ? path.dirname(path.dirname(path.resolve(asarPath))).replace(/'/g, "''")
-    : '';
-
-  // 1) По пути установки (надёжнее, чем по имени — exe может быть «Яндекс Музыка.exe»).
-  if (installRoot) {
-    // Одна строка + EncodedCommand: join(';') ломает ForEach-Object { ... }.
-    const ps =
-      "$ErrorActionPreference='SilentlyContinue'; " +
-      `$root = '${installRoot}'; ` +
-      '$n = 0; Get-CimInstance Win32_Process | ForEach-Object { ' +
-      '$p = $_.ExecutablePath; ' +
-      'if ($p -and $p.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { ' +
-      '$n++; try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} } }; ' +
-      'Write-Output $n';
-    try {
-      const b64 = Buffer.from(ps, 'utf16le').toString('base64');
-      const r = spawnSync(
-        'powershell',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64],
-        { encoding: 'utf8', timeout: 25000, windowsHide: true },
-      );
-      const n = parseInt(String(r.stdout || '').trim().split(/\r?\n/).pop(), 10);
-      if (Number.isFinite(n) && n > 0) {
-        killed += n;
-        methods.push('path:' + n);
-      }
-    } catch (_) {}
-  }
-
-  // 2) По типичным именам процессов (на случай другого пути).
-  const images = ['Y.Music.exe', 'YandexMusic.exe', 'Яндекс Музыка.exe'];
-  for (const img of images) {
-    try {
-      const r = spawnSync('taskkill', ['/F', '/IM', img, '/T'], {
-        encoding: 'utf8',
-        timeout: 15000,
-        windowsHide: true,
-      });
-      const out = String(r.stdout || '') + String(r.stderr || '');
-      if (/успешн|SUCCESS|terminated/i.test(out) || r.status === 0) {
-        methods.push('taskkill:' + img);
-        killed += 1;
-      }
-    } catch (_) {}
-  }
-
-  if (killed > 0 || methods.length) {
-    // Дать ОС отпустить handles на asar/exe.
-    sleepMs(1500);
-  }
-  return { killed, methods };
-}
-
-function loadAsar() {
-  try {
-    return require('@electron/asar');
+    return hit ? path.join(dir, hit) : null;
   } catch (_) {
-    throw new Error('Нужен @electron/asar. Выполните: pnpm install');
+    return null;
   }
 }
 
-async function loadElectronFuses() {
-  // v1 — CommonJS; v2 — ESM-only (require падает с ERR_REQUIRE_ESM).
-  try {
-    return require('@electron/fuses');
-  } catch (e) {
-    const msg = String(e && e.message ? e.message : e);
-    if (!/ERR_REQUIRE_ESM|ES Module/i.test(msg) && e && e.code !== 'ERR_REQUIRE_ESM') {
-      throw e;
-    }
-    return import('@electron/fuses');
-  }
+function rpcConfigDir() {
+  return process.env.APPDATA
+    ? path.join(process.env.APPDATA, 'yandex-music-rpc')
+    : path.join(os.homedir(), 'yandex-music-rpc');
 }
 
-async function disableAsarIntegrity(exePath) {
-  const fuses = await loadElectronFuses();
-  const { flipFuses, FuseVersion, FuseV1Options } = fuses;
-  const bak = exePath + BAK_EXE;
-  if (!fs.existsSync(bak)) fs.copyFileSync(exePath, bak);
-  await flipFuses(exePath, {
-    version: FuseVersion.V1,
-    [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: false,
-    [FuseV1Options.OnlyLoadAppFromAsar]: false,
-  });
-  try {
-    fs.writeFileSync(exePath + FUSES_MARK, new Date().toISOString(), 'utf8');
-  } catch (_) {}
+function launcherCmdPath() {
+  return path.join(rpcConfigDir(), 'Launch Yandex Music (RPC bridge).cmd');
 }
 
-async function createAsarPackage(asar, srcDir, destFile) {
-  const ret = asar.createPackage(srcDir, destFile);
-  if (ret && typeof ret.then === 'function') await ret;
-  if (!fs.existsSync(destFile)) throw new Error('Не удалось собрать asar: ' + destFile);
+function launcherPs1Path() {
+  return path.join(rpcConfigDir(), 'Launch Yandex Music (RPC bridge).ps1');
 }
 
-async function replaceAsar(asar, extractDir, asarPath) {
-  const tmpAsar = path.join(os.tmpdir(), `ym-rpc-bridge-${process.pid}-${Date.now()}.asartmp`);
-  try {
-    await createAsarPackage(asar, extractDir, tmpAsar);
-    fs.copyFileSync(tmpAsar, asarPath);
-  } catch (e) {
-    const code = e && e.code ? e.code : '';
-    if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') {
-      throw new Error('Не удалось записать app.asar — закройте Яндекс.Музыку полностью и повторите.');
-    }
-    throw e;
-  } finally {
-    try { if (fs.existsSync(tmpAsar)) fs.unlinkSync(tmpAsar); } catch (_) {}
-  }
+function markerPath() {
+  return path.join(rpcConfigDir(), MARKER_FILE);
 }
 
-function patchExtractedApp(extractDir) {
-  const bridgeSrc = resolveBridgeFile(BRIDGE_FILE);
-  const hookSrc = resolveBridgeFile(HOOK_FILE);
-  const bootSrc = resolveBridgeFile(BOOTSTRAP_FILE);
-  fs.copyFileSync(bridgeSrc, path.join(extractDir, BRIDGE_FILE));
-  fs.copyFileSync(hookSrc, path.join(extractDir, HOOK_FILE));
-  fs.copyFileSync(bootSrc, path.join(extractDir, BOOTSTRAP_FILE));
-
-  const pkgPath = path.join(extractDir, 'package.json');
-  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-  if (!pkg.__ymRpcOriginalMain) pkg.__ymRpcOriginalMain = pkg.main || './index.js';
-  pkg.main = './' + BOOTSTRAP_FILE;
-  fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2), 'utf8');
-}
-
-function isPatchedAsar(asar, asarPath) {
-  try {
-    const pkgRaw = asar.extractFile(asarPath, 'package.json').toString('utf8');
-    const pkg = JSON.parse(pkgRaw);
-    const mainOk = pkg.main === './' + BOOTSTRAP_FILE || pkg.main === BOOTSTRAP_FILE;
-    if (!mainOk) return false;
-    // После обновления клиента main иногда ещё старый, иногда битый asar без файлов моста.
-    try {
-      asar.extractFile(asarPath, BOOTSTRAP_FILE);
-      asar.extractFile(asarPath, HOOK_FILE);
-      asar.extractFile(asarPath, BRIDGE_FILE);
-    } catch (_) {
-      return false;
-    }
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-async function install(asarPath) {
-  const asar = loadAsar();
-  const exePath = findYandexExe(asarPath);
-  if (!exePath) throw new Error('Не найден exe Яндекс.Музыки рядом с resources');
-
-  const closed = forceCloseYandexMusic(asarPath);
-
-  // Убрать остатки старого unpacked-режима
-  const legacyApp = path.join(path.dirname(asarPath), 'app');
-  const legacyDisabled = asarPath + '.ymrpc-disabled';
-  if (fs.existsSync(legacyApp)) {
-    try { fs.rmSync(legacyApp, { recursive: true, force: true }); } catch (_) {}
-  }
-  if (fs.existsSync(legacyDisabled) && !fs.existsSync(asarPath)) {
-    fs.renameSync(legacyDisabled, asarPath);
-  } else if (fs.existsSync(legacyDisabled)) {
-    try { fs.unlinkSync(legacyDisabled); } catch (_) {}
-  }
-
-  const bakAsar = asarPath + BAK_ASAR;
-  if (!fs.existsSync(bakAsar)) fs.copyFileSync(asarPath, bakAsar);
-
-  await disableAsarIntegrity(exePath);
-
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ym-rpc-bridge-'));
-  try {
-    // Всегда патчим от чистого бэкапа
-    asar.extractAll(bakAsar, tmp);
-    patchExtractedApp(tmp);
-    try {
-      await replaceAsar(asar, tmp, asarPath);
-    } catch (e) {
-      // Повтор после ещё одного kill — иногда handles отпускаются с задержкой.
-      forceCloseYandexMusic(asarPath);
-      sleepMs(1200);
-      await replaceAsar(asar, tmp, asarPath);
-    }
-  } finally {
-    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) {}
-  }
-
-  const launched = launchYandexMusic(exePath);
-  return {
-    ok: true,
-    asarPath,
-    exePath,
-    backupAsar: bakAsar,
-    backupExe: exePath + BAK_EXE,
-    installed: true,
-    mode: 'asar+fuses',
-    closedYandexMusic: closed,
-    launchedYandexMusic: launched,
-  };
-}
-
-/** PowerShell -EncodedCommand (UTF-16LE) — кириллические пути не ломаются в -Command. */
-function runPowerShellEncoded(script, timeoutMs = 15000) {
+/** PowerShell -EncodedCommand (UTF-16LE) — кириллические пути не ломаются. */
+function runPowerShellEncoded(script, timeoutMs = 20000) {
   const b64 = Buffer.from(String(script), 'utf16le').toString('base64');
   return spawnSync(
     'powershell',
@@ -417,176 +117,290 @@ function runPowerShellEncoded(script, timeoutMs = 15000) {
   );
 }
 
-/**
- * Запуск YM. На Windows: Start-Process через -EncodedCommand, иначе spawn с cwd.
- */
-function trySpawnYandexMusic(exePath) {
-  const workDir = path.dirname(exePath);
-  if (process.platform === 'win32') {
-    const exeLit = String(exePath).replace(/'/g, "''");
-    const dirLit = String(workDir).replace(/'/g, "''");
-    const ps =
-      "$ErrorActionPreference='Stop'; " +
-      `Start-Process -FilePath '${exeLit}' -WorkingDirectory '${dirLit}'`;
-    const r = runPowerShellEncoded(ps, 20000);
-    if (r.status === 0) return true;
-    // Fallback 1: explorer (иногда поднимает GUI, когда CreateProcess из Electron молчит).
-    try {
-      const child = spawn('explorer.exe', [exePath], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-      });
-      child.unref();
-      return true;
-    } catch (_) {}
-    // Fallback 2: прямой CreateProcess с cwd установки.
-    try {
-      const child = spawn(exePath, [], {
-        detached: true,
-        stdio: 'ignore',
-        cwd: workDir,
-        windowsHide: false,
-      });
-      child.unref();
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-  try {
-    const child = spawn(exePath, [], { detached: true, stdio: 'ignore', cwd: workDir });
-    child.unref();
-    return true;
-  } catch (_) {
-    return false;
-  }
+function sleepMs(ms) {
+  spawnSync(process.execPath, ['-e', `setTimeout(()=>{},${Number(ms) || 0})`], {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
 }
 
-/** Запуск клиента после установки моста / старта RPC. true только если процесс реально жив. */
+function forceCloseYandexMusic() {
+  if (process.platform !== 'win32') return { killed: 0 };
+  const r = spawnSync(
+    'taskkill',
+    ['/F', '/IM', 'Яндекс Музыка.exe', '/T'],
+    { encoding: 'utf8', windowsHide: true, timeout: 15000 },
+  );
+  sleepMs(1500);
+  return { killed: r.status === 0 ? 1 : 0 };
+}
+
+/** Снять старый asar+fuses патч (если остался от прошлых версий). */
+function restoreLegacyAsarPatch(asarPath) {
+  const restored = { asar: false, exe: false };
+  const bakAsar = asarPath + BAK_ASAR;
+  const exePath = findYandexExe(asarPath);
+  if (fs.existsSync(bakAsar) && fs.existsSync(asarPath)) {
+    try {
+      const asar = require('@electron/asar');
+      let patched = false;
+      try {
+        const pkg = JSON.parse(asar.extractFile(asarPath, 'package.json').toString('utf8'));
+        patched = !!(pkg && (pkg.main === './ym-rpc-bootstrap.js' || pkg.__ymRpcOriginalMain));
+      } catch (_) {}
+      if (patched || fs.existsSync((exePath || '') + FUSES_MARK)) {
+        forceCloseYandexMusic();
+        fs.copyFileSync(bakAsar, asarPath);
+        restored.asar = true;
+      }
+    } catch (_) {}
+  }
+  if (exePath && fs.existsSync(exePath + BAK_EXE)) {
+    try {
+      forceCloseYandexMusic();
+      fs.copyFileSync(exePath + BAK_EXE, exePath);
+      try { fs.unlinkSync(exePath + FUSES_MARK); } catch (_) {}
+      restored.exe = true;
+    } catch (_) {}
+  }
+  return restored;
+}
+
+function desktopShortcutPath() {
+  return path.join(os.homedir(), 'Desktop', 'Яндекс Музыка (RPC).lnk');
+}
+
+/** Есть ли уже процесс клиента (не наш RPC). */
+function isYandexMusicExeRunning() {
+  if (process.platform !== 'win32') return false;
+  const ps =
+    "$ErrorActionPreference='SilentlyContinue'; " +
+    "$p = Get-CimInstance Win32_Process | Where-Object { " +
+    "$_.Name -eq 'Y.Music.exe' -or $_.Name -eq 'YandexMusic.exe' -or $_.Name -eq 'Яндекс Музыка.exe' -or " +
+    "($_.ExecutablePath -and ($_.ExecutablePath -match '[\\\\/]YandexMusic[\\\\/]') -and ($_.ExecutablePath -notmatch 'discord-rpc|Yandex Music RPC')) " +
+    '} | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) { Write-Output $p }';
+  const r = runPowerShellEncoded(ps, 8000);
+  return !!(r.stdout || '').trim();
+}
+
+/** CDP уже слушает — повторный запуск не нужен. */
+function isCdpPortOpen() {
+  if (process.platform !== 'win32') return false;
+  const ps =
+    `$ErrorActionPreference='SilentlyContinue'; ` +
+    `try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 "http://127.0.0.1:${CDP_PORT}/json/version"; if ($r.StatusCode -eq 200) { '1' } } catch {}`;
+  const r = runPowerShellEncoded(ps, 4000);
+  return (r.stdout || '').trim() === '1';
+}
+
+/**
+ * Запуск клиента с --remote-debugging-port (как ярлык «Яндекс Музыка (RPC)»).
+ * Кириллический путь — только через PowerShell EncodedCommand.
+ */
 function launchYandexMusic(exePath) {
   if (!exePath || !fs.existsSync(exePath)) return false;
-  sleepMs(900);
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (attempt > 0) sleepMs(1200);
-    try {
-      trySpawnYandexMusic(exePath);
-    } catch (_) {}
-    // Дать Electron-клиенту подняться.
-    sleepMs(2500);
-    if (isYandexMusicExeRunning()) return true;
-  }
-  return false;
+  const exeLit = String(exePath).replace(/'/g, "''");
+  const dirLit = path.dirname(exePath).replace(/'/g, "''");
+  const ps =
+    "$ErrorActionPreference='Stop'; " +
+    `Start-Process -FilePath '${exeLit}' -WorkingDirectory '${dirLit}' ` +
+    `-ArgumentList '--remote-debugging-port=${CDP_PORT}'`;
+  const r = runPowerShellEncoded(ps, 20000);
+  return r.status === 0;
 }
 
-/** Запустить YM, если ещё не запущена. */
+/** Запустить YM с CDP, если ещё не запущена и порт свободен. */
 function launchYandexMusicIfNeeded(asarPath) {
-  if (isYandexMusicExeRunning()) {
-    return { ok: true, launchedYandexMusic: false, alreadyRunning: true };
+  if (process.platform !== 'win32') {
+    return { ok: false, launchedYandexMusic: false, error: 'not_windows' };
   }
-  const exePath = asarPath ? findYandexExe(asarPath) : null;
+  if (isCdpPortOpen()) {
+    return { ok: true, launchedYandexMusic: false, alreadyRunning: true, cdpOpen: true };
+  }
+  if (isYandexMusicExeRunning()) {
+    return { ok: true, launchedYandexMusic: false, alreadyRunning: true, cdpOpen: false };
+  }
+  let exePath = asarPath ? findYandexExe(asarPath) : null;
+  if (!exePath) {
+    try {
+      const marker = markerPath();
+      if (fs.existsSync(marker)) {
+        const meta = JSON.parse(fs.readFileSync(marker, 'utf8'));
+        if (meta && meta.exePath && fs.existsSync(meta.exePath)) exePath = meta.exePath;
+      }
+    } catch (_) {}
+  }
   if (!exePath) {
     return { ok: false, launchedYandexMusic: false, error: 'exe_not_found' };
   }
+  // Обновить ярлык, если пропал.
+  try {
+    if (!fs.existsSync(desktopShortcutPath())) createDesktopShortcut(exePath);
+  } catch (_) {}
   const launched = launchYandexMusic(exePath);
   return {
     ok: launched,
     launchedYandexMusic: launched,
     exePath,
+    cdpPort: CDP_PORT,
     error: launched ? undefined : 'launch_failed',
   };
 }
 
-async function uninstall(asarPath) {
-  const bakAsar = asarPath + BAK_ASAR;
+function writeLauncher(exePath) {
+  const dir = rpcConfigDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const ps1Path = launcherPs1Path();
+  const cmdPath = launcherCmdPath();
+  // .ps1 с BOM — кириллический путь exe не ломается.
+  const ps1 =
+    '$ErrorActionPreference = \'Stop\'\r\n' +
+    `$exe = '${String(exePath).replace(/'/g, "''")}'\r\n` +
+    `$wd = '${path.dirname(exePath).replace(/'/g, "''")}'\r\n` +
+    `Start-Process -FilePath $exe -WorkingDirectory $wd -ArgumentList '--remote-debugging-port=${CDP_PORT}'\r\n`;
+  fs.writeFileSync(ps1Path, '\uFEFF' + ps1, 'utf8');
+  // .cmd без кириллицы — только вызов powershell -File (имя ps1 ASCII).
+  const cmd =
+    '@echo off\r\n' +
+    'REM Yandex Music RPC CDP launcher (no Cyrillic in this file)\r\n' +
+    'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Launch Yandex Music (RPC bridge).ps1"\r\n';
+  fs.writeFileSync(cmdPath, cmd, 'ascii');
+  fs.writeFileSync(
+    markerPath(),
+    JSON.stringify(
+      {
+        mode: 'cdp',
+        port: CDP_PORT,
+        exePath,
+        launcher: cmdPath,
+        launcherPs1: ps1Path,
+        installedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  );
+  return cmdPath;
+}
+
+/** Ярлык сразу на exe + аргумент порта — без .cmd (иначе cmd ломает UTF-8 кириллицу). */
+function createDesktopShortcut(exePath) {
+  if (process.platform !== 'win32') return null;
+  const lnk = desktopShortcutPath();
+  const ps =
+    `$ws = New-Object -ComObject WScript.Shell\n` +
+    `$s = $ws.CreateShortcut('${lnk.replace(/'/g, "''")}')\n` +
+    `$s.TargetPath = '${String(exePath).replace(/'/g, "''")}'\n` +
+    `$s.Arguments = '--remote-debugging-port=${CDP_PORT}'\n` +
+    `$s.WorkingDirectory = '${path.dirname(exePath).replace(/'/g, "''")}'\n` +
+    `$s.IconLocation = '${String(exePath).replace(/'/g, "''")},0'\n` +
+    `$s.Description = 'Yandex Music + Discord RPC (CDP)'\n` +
+    `$s.Save()\n` +
+    `Write-Output 'ok'`;
+  const r = runPowerShellEncoded(ps, 20000);
+  if (r.status !== 0) {
+    try {
+      console.error('shortcut stderr:', (r.stderr || r.stdout || '').slice(0, 400));
+    } catch (_) {}
+    return null;
+  }
+  return lnk;
+}
+
+function install(asarPath) {
   const exePath = findYandexExe(asarPath);
-  const legacyApp = path.join(path.dirname(asarPath), 'app');
-  const legacyDisabled = asarPath + '.ymrpc-disabled';
+  if (!exePath) throw new Error('Не найден exe Яндекс.Музыки');
 
-  const closed = forceCloseYandexMusic(asarPath);
+  const legacy = restoreLegacyAsarPatch(asarPath);
+  const launcher = writeLauncher(exePath);
+  const shortcut = createDesktopShortcut(exePath);
 
-  if (fs.existsSync(legacyApp)) {
-    try { fs.rmSync(legacyApp, { recursive: true, force: true }); } catch (_) {}
-  }
-  if (fs.existsSync(legacyDisabled)) {
-    if (!fs.existsSync(asarPath)) fs.renameSync(legacyDisabled, asarPath);
-    else try { fs.unlinkSync(legacyDisabled); } catch (_) {}
-  }
+  return {
+    ok: true,
+    installed: true,
+    mode: 'cdp',
+    cdpPort: CDP_PORT,
+    asarPath,
+    exePath,
+    launcher,
+    shortcut,
+    legacyRestored: legacy,
+    message:
+      'Мост CDP установлен. Запускайте Яндекс.Музыку через ярлык «Яндекс Музыка (RPC)» ' +
+      `на рабочем столе (порт ${CDP_PORT}). Обычный ярлык клиента — без моста.`,
+  };
+}
 
-  if (fs.existsSync(bakAsar)) {
+function uninstall(asarPath) {
+  const legacy = restoreLegacyAsarPatch(asarPath);
+  const removed = [];
+  for (const p of [launcherCmdPath(), launcherPs1Path(), markerPath()]) {
     try {
-      fs.copyFileSync(bakAsar, asarPath);
-    } catch (e) {
-      forceCloseYandexMusic(asarPath);
-      sleepMs(1200);
-      fs.copyFileSync(bakAsar, asarPath);
-    }
-  } else if (!isPatchedAsar(loadAsar(), asarPath)) {
-    return { ok: true, asarPath, installed: false, message: 'Мост не был установлен', closedYandexMusic: closed };
-  } else {
-    throw new Error('Нет app.asar.bak-ymrpc для восстановления');
-  }
-
-  if (exePath && fs.existsSync(exePath + BAK_EXE)) {
-    try {
-      fs.copyFileSync(exePath + BAK_EXE, exePath);
-      try { fs.unlinkSync(exePath + FUSES_MARK); } catch (_) {}
-    } catch (e) {
-      forceCloseYandexMusic(asarPath);
-      sleepMs(1200);
-      try {
-        fs.copyFileSync(exePath + BAK_EXE, exePath);
-        try { fs.unlinkSync(exePath + FUSES_MARK); } catch (_) {}
-      } catch (_) {
-        // exe всё ещё занят
+      if (fs.existsSync(p)) {
+        fs.unlinkSync(p);
+        removed.push(p);
       }
-    }
+    } catch (_) {}
   }
-
-  return { ok: true, asarPath, exePath, installed: false, restoredFromBackup: true, closedYandexMusic: closed };
+  const desk = desktopShortcutPath();
+  try {
+    if (fs.existsSync(desk)) {
+      fs.unlinkSync(desk);
+      removed.push(desk);
+    }
+  } catch (_) {}
+  return {
+    ok: true,
+    installed: false,
+    mode: 'cdp',
+    removed,
+    legacyRestored: legacy,
+  };
 }
 
 function status(asarPath) {
-  if (!asarPath || !fs.existsSync(asarPath)) {
-    // legacy unpacked?
-    const maybe = asarPath || candidateAsarPaths()[0];
-    const legacyApp = maybe ? path.join(path.dirname(maybe), 'app') : null;
-    if (legacyApp && fs.existsSync(legacyApp)) {
-      return {
-        ok: true,
-        asarPath: maybe,
-        installed: true,
-        mode: 'legacy-unpacked-app-dir',
-        warning: 'Старый режим unpacked — удалите мост и установите заново',
-      };
+  const exePath = asarPath ? findYandexExe(asarPath) : null;
+  const marker = markerPath();
+  const launcher = launcherCmdPath();
+  let meta = null;
+  try {
+    if (fs.existsSync(marker)) meta = JSON.parse(fs.readFileSync(marker, 'utf8'));
+  } catch (_) {}
+  const installed = !!(meta && meta.mode === 'cdp' && fs.existsSync(launcher));
+
+  // legacy asar still patched?
+  let legacyPatched = false;
+  try {
+    if (asarPath && fs.existsSync(asarPath)) {
+      const asar = require('@electron/asar');
+      const pkg = JSON.parse(asar.extractFile(asarPath, 'package.json').toString('utf8'));
+      legacyPatched = pkg.main === './ym-rpc-bootstrap.js';
     }
-    return { ok: false, installed: false, error: 'app.asar не найден' };
-  }
-  const asar = loadAsar();
-  const installed = isPatchedAsar(asar, asarPath);
-  const exePath = findYandexExe(asarPath);
+  } catch (_) {}
+
   return {
     ok: true,
-    asarPath,
+    asarPath: asarPath || null,
+    exePath,
     installed,
-    mode: installed ? 'asar+fuses' : 'stock',
-    backupPresent: fs.existsSync(asarPath + BAK_ASAR),
-    exeBackupPresent: !!(exePath && fs.existsSync(exePath + BAK_EXE)),
-    fusesMarked: !!(exePath && fs.existsSync(exePath + FUSES_MARK)),
-    packageMain: (() => {
-      try {
-        return JSON.parse(asar.extractFile(asarPath, 'package.json').toString('utf8')).main;
-      } catch (_) { return null; }
-    })(),
+    mode: installed ? 'cdp' : legacyPatched ? 'asar+fuses-legacy' : 'none',
+    cdpPort: CDP_PORT,
+    launcher: installed ? launcher : null,
+    marker: installed ? marker : null,
+    legacyPatched,
+    packageMain: null,
   };
 }
 
 function parseArgs(argv) {
   const out = { uninstall: false, status: false, launch: false, asar: null };
-  for (const a of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
     if (a === '--uninstall') out.uninstall = true;
     else if (a === '--status') out.status = true;
     else if (a === '--launch' || a === '--launch-if-needed') out.launch = true;
+    else if (a === '--asar' && argv[i + 1]) out.asar = argv[++i];
     else if (a.startsWith('--asar=')) out.asar = a.slice('--asar='.length);
   }
   return out;
@@ -594,69 +408,55 @@ function parseArgs(argv) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const asarPath = resolveAsarPath(args.asar);
-
-  const soft = process.env.YM_RPC_BRIDGE_INSTALL_SOFT === '1'
-    || process.argv.includes('--soft');
-
-  if (args.status) {
-    const st = status(asarPath);
-    console.log(JSON.stringify(st, null, 2));
-    process.exit(st.ok ? 0 : 1);
-  }
-  if (args.launch) {
-    const res = launchYandexMusicIfNeeded(asarPath);
-    console.log(JSON.stringify(res, null, 2));
-    process.exit(res.ok || res.alreadyRunning ? 0 : 1);
-  }
-  if (!asarPath) {
-    const payload = {
-      ok: soft,
-      installed: false,
-      skipped: true,
-      reason: 'yandex_music_not_found',
-      error: 'Не найден app.asar Яндекс.Музыки.',
-    };
-    console.log(JSON.stringify(payload, null, 2));
-    if (soft) {
-      console.error('Яндекс.Музыка не найдена — мост будет установлен при следующем запуске RPC.');
-      process.exit(0);
+  let asarPath = null;
+  try {
+    asarPath = resolveAsarPath(args.asar);
+  } catch (e) {
+    if (args.status) {
+      console.log(JSON.stringify({ ok: false, installed: false, error: String(e.message || e) }, null, 2));
+      return;
     }
-    console.error('Не найден app.asar Яндекс.Музыки.');
-    process.exit(2);
+    if (args.launch) {
+      // exe можно взять из маркера без asar
+      const res = launchYandexMusicIfNeeded(null);
+      console.log(JSON.stringify(res, null, 2));
+      process.exit(res.ok || res.alreadyRunning ? 0 : 1);
+      return;
+    }
+    throw e;
   }
-  console.log('asar:', asarPath);
 
-  if (args.uninstall) {
-    console.log(JSON.stringify(await uninstall(asarPath), null, 2));
-    console.log('Готово. Запустите Яндекс.Музыку.');
-    process.exit(0);
-  }
+  console.error('asar:', asarPath);
+  let result;
+  if (args.status) result = status(asarPath);
+  else if (args.launch) result = launchYandexMusicIfNeeded(asarPath);
+  else if (args.uninstall) result = uninstall(asarPath);
+  else result = install(asarPath);
 
-  const installed = await install(asarPath);
-  console.log(JSON.stringify(installed, null, 2));
-  if (installed && installed.launchedYandexMusic) {
-    console.log('Мост установлен. Яндекс.Музыка запущена.');
-  } else {
-    console.log('Мост установлен. Запустите Яндекс.Музыку и Yandex Music RPC.');
+  console.log(JSON.stringify(result, null, 2));
+  if (!args.status && !args.launch) {
+    console.error(result.message || (result.installed ? 'Готово.' : 'Снято.'));
   }
+  if (args.launch && !(result.ok || result.alreadyRunning)) process.exit(1);
 }
 
 if (require.main === module) {
   main().catch((e) => {
-    console.error(e && e.message ? e.message : e);
+    console.error(String(e && e.stack ? e.stack : e));
+    console.log(JSON.stringify({ ok: false, error: String(e && e.message ? e.message : e) }));
     process.exit(1);
   });
 }
 
 module.exports = {
-  resolveAsarPath,
-  forceCloseYandexMusic,
-  launchYandexMusic,
-  launchYandexMusicIfNeeded,
-  findYandexExe,
   install,
   uninstall,
   status,
-  candidateAsarPaths,
+  CDP_PORT,
+  launcherCmdPath,
+  launcherPs1Path,
+  desktopShortcutPath,
+  launchYandexMusic,
+  launchYandexMusicIfNeeded,
+  restoreLegacyAsarPatch,
 };

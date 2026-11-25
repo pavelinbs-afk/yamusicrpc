@@ -2054,6 +2054,30 @@ let bridgeAutoState = {
   inProgress: false,
 };
 
+/** Один автозапуск «Яндекс Музыка (RPC)» за жизнь процесса RPC. */
+let ymStartupLaunchDone = false;
+
+/**
+ * Запуск клиента с CDP (ярлык / exe + порт), если ещё не открыт.
+ * @returns {Promise<{ok?: boolean, launchedYandexMusic?: boolean, alreadyRunning?: boolean, error?: string}>}
+ */
+async function launchYandexMusicForRpc() {
+  if (process.platform !== 'win32') {
+    return { ok: false, launchedYandexMusic: false, error: 'not_windows' };
+  }
+  try {
+    await refreshYandexMusicProcessRunning();
+  } catch (_) {}
+  if (isYandexMusicProcessRunning()) {
+    return { ok: true, launchedYandexMusic: false, alreadyRunning: true };
+  }
+  try {
+    return await runBridgeCli(['--launch-if-needed']);
+  } catch (e) {
+    return { ok: false, launchedYandexMusic: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
 function enrichBridgeStatus(st) {
   const base = st && typeof st === 'object' ? st : { ok: false, installed: false };
   const liveMs = clientBridgeFreshMs();
@@ -2124,17 +2148,34 @@ async function ensureClientBridgeInstalled(opts = {}) {
     bridgeAutoState.lastCheckAt = Date.now();
     bridgeAutoState.lastStatus = st;
     if (st && st.installed) {
-      log('Мост в клиенте: уже установлен', st.asarPath || '');
-      // Только при старте RPC (не на periodic): поднять клиент, если закрыт.
+      log(
+        'Мост в клиенте: уже установлен',
+        st.mode || '',
+        st.launcher || st.asarPath || '',
+      );
+      let launchedYandexMusic = false;
       const wantLaunch =
-        opts.launchYm === true ||
-        opts.reason === 'startup' ||
-        opts.reason === 'retry_after_busy';
-      // Запуск YM в фоне — иначе spawn/PowerShell на старте вешают Electron UI.
-      if (wantLaunch && !isYandexMusicProcessRunning()) {
-        scheduleLaunchYandexMusicApp(st.asarPath || null, 'после старта RPC');
+        !ymStartupLaunchDone &&
+        (opts.launchYm === true ||
+          opts.reason === 'startup' ||
+          opts.reason === 'retry_after_busy');
+      if (wantLaunch) {
+        ymStartupLaunchDone = true;
+        try {
+          const launchRes = await launchYandexMusicForRpc();
+          launchedYandexMusic = !!(launchRes && launchRes.launchedYandexMusic);
+          if (launchedYandexMusic) {
+            log('Яндекс.Музыка: запущена через ярлык RPC (CDP)');
+          } else if (launchRes && launchRes.alreadyRunning) {
+            log('Яндекс.Музыка: уже запущена');
+          } else if (launchRes && launchRes.error) {
+            log('Яндекс.Музыка: не удалось запустить —', launchRes.error);
+          }
+        } catch (e) {
+          log('Яндекс.Музыка: ошибка запуска —', e && e.message ? e.message : e);
+        }
       }
-      return { ok: true, installed: true, already: true, ...st };
+      return { ok: true, installed: true, already: true, launchedYandexMusic, ...st };
     }
     if (!force && !autoEnabled) {
       return { ok: true, installed: false, skipped: true };
@@ -2146,16 +2187,31 @@ async function ensureClientBridgeInstalled(opts = {}) {
     if (result && result.ok !== false && result.installed !== false) {
       bridgeAutoState.lastAutoOk = true;
       bridgeAutoState.lastAutoError = null;
-      log('Мост в клиенте: установлен автоматически', result.asarPath || '');
-      if (result.launchedYandexMusic) {
-        log('Яндекс.Музыка: запущена после установки моста');
-      } else if (!isYandexMusicProcessRunning()) {
-        scheduleLaunchYandexMusicApp(
-          result.asarPath || (st && st.asarPath) || null,
-          'после установки моста',
-        );
+      log(
+        'Мост в клиенте: установлен автоматически',
+        result.mode || 'cdp',
+        result.launcher || '',
+      );
+      if (result.message) log(result.message);
+      let launchedYandexMusic = false;
+      const wantLaunch =
+        !ymStartupLaunchDone &&
+        (opts.launchYm === true ||
+          opts.reason === 'startup' ||
+          opts.reason === 'retry_after_busy');
+      if (wantLaunch) {
+        ymStartupLaunchDone = true;
+        try {
+          const launchRes = await launchYandexMusicForRpc();
+          launchedYandexMusic = !!(launchRes && launchRes.launchedYandexMusic);
+          if (launchedYandexMusic) {
+            log('Яндекс.Музыка: запущена через ярлык RPC (CDP)');
+          }
+        } catch (e) {
+          log('Яндекс.Музыка: ошибка запуска —', e && e.message ? e.message : e);
+        }
       }
-      return { ok: true, installed: true, auto: true, ...result };
+      return { ok: true, installed: true, auto: true, launchedYandexMusic, ...result };
     }
     const err = (result && result.error) || 'bridge install failed';
     bridgeAutoState.lastAutoOk = false;
@@ -2451,32 +2507,20 @@ async function refreshYandexMusicProcessRunning() {
   ymProcessRefreshInFlight = (async () => {
     let running = false;
     try {
-      const names = ['Y.Music.exe', 'YandexMusic.exe', 'Яндекс Музыка.exe'];
-      for (const name of names) {
-        const r = await spawnCaptured('tasklist', ['/FI', `IMAGENAME eq ${name}`, '/NH'], {
-          timeout: 2500,
-        });
-        const out = `${r.stdout || ''}${r.stderr || ''}`;
-        if (out && !/no tasks|информац|info:/i.test(out) && out.toLowerCase().includes(name.toLowerCase())) {
-          running = true;
-          break;
-        }
-      }
-      if (!running) {
-        const ps =
-          "$ErrorActionPreference='SilentlyContinue'; " +
-          "$p = Get-CimInstance Win32_Process | Where-Object { " +
-          "$_.Name -eq 'Y.Music.exe' -or $_.Name -eq 'YandexMusic.exe' -or $_.Name -eq 'Яндекс Музыка.exe' -or " +
-          "($_.ExecutablePath -and ($_.ExecutablePath -match '[\\\\/]YandexMusic[\\\\/]') -and ($_.ExecutablePath -notmatch 'discord-rpc|Yandex Music RPC')) " +
-          '} | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) { Write-Output $p }';
-        const b64 = Buffer.from(ps, 'utf16le').toString('base64');
-        const r = await spawnCaptured(
-          'powershell',
-          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64],
-          { timeout: 8000 },
-        );
-        if ((r.stdout || '').trim()) running = true;
-      }
+      // Один CIM-запрос вместо 3×tasklist + CIM — меньше нагрузка на UI.
+      const ps =
+        "$ErrorActionPreference='SilentlyContinue'; " +
+        "$p = Get-CimInstance Win32_Process | Where-Object { " +
+        "$_.Name -eq 'Y.Music.exe' -or $_.Name -eq 'YandexMusic.exe' -or $_.Name -eq 'Яндекс Музыка.exe' -or " +
+        "($_.ExecutablePath -and ($_.ExecutablePath -match '[\\\\/]YandexMusic[\\\\/]') -and ($_.ExecutablePath -notmatch 'discord-rpc|Yandex Music RPC')) " +
+        '} | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) { Write-Output $p }';
+      const b64 = Buffer.from(ps, 'utf16le').toString('base64');
+      const r = await spawnCaptured(
+        'powershell',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64],
+        { timeout: 6000 },
+      );
+      if ((r.stdout || '').trim()) running = true;
     } catch (_) {
       running = ymProcessCache.running === true;
     }
@@ -2493,9 +2537,10 @@ async function refreshYandexMusicProcessRunning() {
 function startYandexMusicProcessWatch() {
   if (process.platform !== 'win32') return;
   refreshYandexMusicProcessRunning().catch(() => {});
+  // Не чаще 4с: CIM/tasklist на каждом тике 1с грузили систему и вешали Electron.
   setInterval(() => {
     refreshYandexMusicProcessRunning().catch(() => {});
-  }, YM_PROCESS_CHECK_MS);
+  }, Math.max(4000, YM_PROCESS_CHECK_MS * 4));
 }
 
 /**
@@ -2506,164 +2551,6 @@ function startYandexMusicProcessWatch() {
 function isYandexMusicAlive() {
   if (isYandexMusicProcessRunning()) return true;
   return clientBridgeAgeMs() < YM_GONE_BRIDGE_GRACE_MS;
-}
-
-function findYandexMusicExePath(asarPath) {
-  const roots = [];
-  if (asarPath) {
-    try {
-      roots.push(path.dirname(path.dirname(path.resolve(asarPath))));
-    } catch (_) {}
-  }
-  const local = process.env.LOCALAPPDATA || '';
-  if (local) roots.push(path.join(local, 'Programs', 'YandexMusic'));
-  const preferred = ['Яндекс Музыка.exe', 'Y.Music.exe', 'YandexMusic.exe', 'Yandex Music.exe'];
-  for (const root of roots) {
-    for (const name of preferred) {
-      const p = path.join(root, name);
-      try {
-        if (fs.existsSync(p)) return p;
-      } catch (_) {}
-    }
-  }
-  return null;
-}
-
-function sleepMsAsync(ms) {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms | 0)));
-}
-
-/**
- * Запуск Яндекс.Музыки из RPC — полностью async, без spawnSync.
- */
-async function launchYandexMusicApp(asarPath) {
-  if (process.platform !== 'win32') {
-    return { ok: false, launchedYandexMusic: false, error: 'not_windows' };
-  }
-  await refreshYandexMusicProcessRunning();
-  if (isYandexMusicProcessRunning()) {
-    return { ok: true, launchedYandexMusic: false, alreadyRunning: true };
-  }
-  const exePath = findYandexMusicExePath(asarPath);
-  if (!exePath) {
-    return { ok: false, launchedYandexMusic: false, error: 'exe_not_found' };
-  }
-  const workDir = path.dirname(exePath);
-
-  /** @type {Array<[string, () => Promise<boolean>]>} */
-  const methods = [
-    [
-      'electron.shell.openPath',
-      async () => {
-        try {
-          const electron = require('electron');
-          const shell = electron && electron.shell;
-          if (!shell || typeof shell.openPath !== 'function') return false;
-          const err = await shell.openPath(exePath);
-          return !err;
-        } catch (_) {
-          return false;
-        }
-      },
-    ],
-    [
-      'powershell.Start-Process',
-      async () => {
-        const exeLit = exePath.replace(/'/g, "''");
-        const dirLit = workDir.replace(/'/g, "''");
-        const ps =
-          "$ErrorActionPreference='Stop'; " +
-          `Start-Process -FilePath '${exeLit}' -WorkingDirectory '${dirLit}'`;
-        const b64 = Buffer.from(ps, 'utf16le').toString('base64');
-        const r = await spawnCaptured(
-          'powershell',
-          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', b64],
-          { timeout: 20000 },
-        );
-        return r.status === 0;
-      },
-    ],
-    [
-      'explorer.exe',
-      async () => {
-        try {
-          const child = spawn('explorer.exe', [exePath], {
-            detached: true,
-            stdio: 'ignore',
-            windowsHide: true,
-          });
-          child.unref();
-          return true;
-        } catch (_) {
-          return false;
-        }
-      },
-    ],
-    [
-      'spawn',
-      async () => {
-        try {
-          const child = spawn(exePath, [], {
-            detached: true,
-            stdio: 'ignore',
-            cwd: workDir,
-            windowsHide: false,
-          });
-          child.unref();
-          return true;
-        } catch (_) {
-          return false;
-        }
-      },
-    ],
-  ];
-
-  for (const [via, fn] of methods) {
-    await refreshYandexMusicProcessRunning();
-    if (isYandexMusicProcessRunning()) {
-      return { ok: true, launchedYandexMusic: false, alreadyRunning: true, exePath };
-    }
-    let ok = false;
-    try {
-      ok = !!(await fn());
-    } catch (_) {
-      ok = false;
-    }
-    if (!ok) continue;
-    await sleepMsAsync(2500);
-    await refreshYandexMusicProcessRunning();
-    if (isYandexMusicProcessRunning()) {
-      return { ok: true, launchedYandexMusic: true, exePath, via };
-    }
-  }
-  return { ok: false, launchedYandexMusic: false, exePath, error: 'launch_failed' };
-}
-
-/** Запуск YM в фоне — не держит ensureClientBridge / UI. */
-function scheduleLaunchYandexMusicApp(asarPath, reason) {
-  setImmediate(() => {
-    launchYandexMusicApp(asarPath)
-      .then((launchRes) => {
-        if (launchRes && launchRes.launchedYandexMusic) {
-          log(
-            'Яндекс.Музыка: запущена',
-            reason ? `(${reason})` : '',
-            launchRes.via ? `via ${launchRes.via}` : '',
-          );
-        } else if (launchRes && launchRes.alreadyRunning) {
-          log('Яндекс.Музыка: уже запущена');
-        } else {
-          log(
-            'Яндекс.Музыка: не открылась —',
-            (launchRes && (launchRes.error || launchRes.exePath)) || 'unknown',
-            'Запустите клиент вручную.',
-          );
-        }
-      })
-      .catch((e) => {
-        log('Яндекс.Музыка: ошибка запуска —', e && e.message ? e.message : e);
-      });
-  });
 }
 
 async function clearBecauseYandexMusicGone(reason) {
@@ -3861,10 +3748,35 @@ function runHttpServer() {
   return server;
 }
 
+/** @type {{ stop: () => void } | null} */
+let cdpBridgePoller = null;
+
+function startClientCdpBridge() {
+  if (cdpBridgePoller) return;
+  try {
+    // eslint-disable-next-line global-require
+    const { startCdpBridgePoller } = require('./lib/cdp-bridge');
+    cdpBridgePoller = startCdpBridgePoller({
+      log: (...args) => {
+        try { log(...args); } catch (_) {}
+      },
+    });
+  } catch (e) {
+    log('CDP мост не запущен:', e && e.message ? e.message : e);
+  }
+}
+
+function stopClientCdpBridge() {
+  if (!cdpBridgePoller) return;
+  try { cdpBridgePoller.stop(); } catch (_) {}
+  cdpBridgePoller = null;
+}
+
 async function gracefulShutdown(reason, opts = {}) {
   if (rpcShutdownStarted) return;
   rpcShutdownStarted = true;
   log(`Выход (${reason}). Сбрасываю статус в Discord.`);
+  stopClientCdpBridge();
   try {
     if (rpc) {
       await clearActivity();
@@ -3916,12 +3828,13 @@ async function main() {
   runHttpServer();
   startDesktopPoller();
   startYandexMusicProcessWatch();
+  // CDP-мост: читает плеер без правки app.asar (YM 5.128+).
+  startClientCdpBridge();
 
-  // Автоустановка моста после старта (не блокируем Discord/HTTP/UI).
+  // Автоустановка CDP-ярлыка и при необходимости запуск «Яндекс Музыка (RPC)».
   setTimeout(() => {
-    ensureClientBridgeInstalled({ reason: 'startup' }).catch(() => {});
-  }, 2500);
-  // Яндекс.Музыка иногда обновляет asar и сносит мост — периодически проверяем.
+    ensureClientBridgeInstalled({ reason: 'startup', launchYm: true }).catch(() => {});
+  }, 3500);
   setInterval(() => {
     ensureClientBridgeInstalled({ reason: 'periodic' }).catch(() => {});
   }, 10 * 60 * 1000);

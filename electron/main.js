@@ -123,6 +123,16 @@ ipcMain.handle('ym-rpc:app-version', () => {
   }
 });
 
+// Packaged Win: sandbox часто не поднимает --type=renderer → пустое окно.
+// AMD/драйверы: без GPU UI стабильнее.
+app.disableHardwareAcceleration();
+try {
+  app.commandLine.appendSwitch('no-sandbox');
+  app.commandLine.appendSwitch('disable-gpu-sandbox');
+  app.commandLine.appendSwitch('disable-gpu');
+  app.commandLine.appendSwitch('disable-gpu-compositing');
+} catch (_) {}
+
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
@@ -159,40 +169,46 @@ if (!gotLock) {
     }
   });
 
-  app.whenReady().then(async () => {
+  app.whenReady().then(() => {
     process.env.RPC_EMBEDDED_IN_ELECTRON = '1';
     process.env.RPC_SCRIPTS_DIR = getScriptsDir();
 
-    let rpcStarted = false;
-    try {
-      const rpcMod = require(indexEntryPath);
-      if (typeof rpcMod.main !== 'function') {
-        throw new Error('index.js не экспортирует main()');
-      }
-      await rpcMod.main();
-      rpcStarted = true;
-    } catch (e) {
-      const text = e && e.message ? e.message : String(e);
-      try {
-        dialog.showErrorBox('Yandex Music RPC', `Не удалось запустить локальный сервис статуса:\n${text}`);
-      } catch (_) {}
-    }
-
-    const ok = await waitForLocalPort(8765);
-    if (!ok && rpcStarted) {
-      try {
-        await dialog.showMessageBox({
-          type: 'warning',
-          title: 'Yandex Music RPC',
-          message: 'Сервис статуса не ответил на порту 8765.',
-          detail: 'Попробуйте перезапустить приложение. Если ошибка повторяется — переустановите программу.',
-        });
-      } catch (_) {}
-    }
-
+    // Сначала окно (тёмный фон), потом тяжёлый index.js — иначе UI белеет, пока грузится RPC.
     const win = createSettingsWindow();
     win.center();
     createTray();
+
+    setImmediate(() => {
+      (async () => {
+        let rpcStarted = false;
+        try {
+          const rpcMod = require(indexEntryPath);
+          if (typeof rpcMod.main !== 'function') {
+            throw new Error('index.js не экспортирует main()');
+          }
+          await rpcMod.main();
+          rpcStarted = true;
+        } catch (e) {
+          const text = e && e.message ? e.message : String(e);
+          try {
+            dialog.showErrorBox('Yandex Music RPC', `Не удалось запустить локальный сервис статуса:\n${text}`);
+          } catch (_) {}
+          return;
+        }
+
+        const ok = await waitForLocalPort(8765, { timeoutMs: 8000 });
+        if (!ok && rpcStarted) {
+          try {
+            await dialog.showMessageBox({
+              type: 'warning',
+              title: 'Yandex Music RPC',
+              message: 'Сервис статуса не ответил на порту 8765.',
+              detail: 'Попробуйте перезапустить приложение. Если ошибка повторяется — переустановите программу.',
+            });
+          } catch (_) {}
+        }
+      })().catch(() => {});
+    });
   });
 }
 

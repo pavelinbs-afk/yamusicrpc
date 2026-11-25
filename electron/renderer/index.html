@@ -229,8 +229,8 @@
     }
   </style>
 </head>
-<body>
-  <header id="app-bar">
+<body style="background:#0e0e10;color:#f2f2f4;margin:0">
+  <header id="app-bar" style="background:#1a1a1f;color:#f2f2f4">
     <span class="rpc-badge">RPC</span>
     <span class="app-version" id="app-version" title="Версия сборки"></span>
     <div class="bar-track" id="bar-track-line">Нет трека</div>
@@ -266,11 +266,11 @@
         <input type="checkbox" class="checkbox-lg" id="bridge-auto-install" />
       </label>
       <p class="hint">
-        Мост ставится сам при установке программы (.exe / .msi) и при запуске RPC
-        (в т.ч. portable), если его ещё нет. Перед записью asar
-        <strong>принудительно закрывается Яндекс.Музыка</strong>.
-        «Установлен» ≠ «работает»: если источник GSMTC — перезапустите Яндекс.Музыку.
-        Удаление отключает автоустановку, чтобы мост не вернулся при следующем старте.
+        С YM&nbsp;5.128 мост работает через CDP: ставится ярлык
+        <strong>«Яндекс Музыка (RPC)»</strong> с&nbsp;<code>--remote-debugging-port=9229</code>
+        (без правки app.asar). При старте RPC клиент открывается сам через этот ярлык,
+        если ещё не запущен. Обычный ярлык Яндекс.Музыки — без моста (останется GSMTC).
+        Удаление снимает ярлык/launcher и отключает автоустановку.
       </p>
       <div class="actions">
         <button type="button" class="primary" id="btn-bridge-install">Установить</button>
@@ -482,7 +482,7 @@
           '<strong>Источник трека:</strong> ' + srcLabel +
             (j.clientBridgeFresh || j.bridgeLive
               ? ' (мост активен)'
-              : (j.bridgeInstalled ? ' (мост в asar есть, но не шлёт данные)' : '')) + '<br/>' +
+              : (j.bridgeInstalled ? ' (мост CDP есть, но не шлёт данные)' : '')) + '<br/>' +
           '<strong>Application ID:</strong> ' + (j.discordClientId || '—') +
             (j.discordClientIdSource ? ' (' + (
               j.discordClientIdSource === 'env' ? 'из переменной окружения' :
@@ -738,8 +738,8 @@
         ? 'данные с моста приходят'
         : (j.installed
           ? (j.ymAlive || j.health === 'installed_idle'
-            ? 'мост в asar есть; сейчас нет активного трека (пауза / стоп) — это нормально'
-            : 'в asar есть, но данные не приходят — откройте Яндекс.Музыку и включите трек')
+            ? 'ярлык CDP есть; нет активного трека или клиент запущен без порта 9229'
+            : 'ярлык есть, но CDP молчит — закройте Яндекс.Музыку и откройте через «Яндекс Музыка (RPC)»')
           : 'нужна установка');
       return 'Проверка моста: ' + health + '.\n' + live + '.';
     }
@@ -813,7 +813,7 @@
     async function runBridgeAction(path, confirmText) {
       if (confirmText && !confirm(confirmText)) return;
       const el = $('bridge-status-hint');
-      el.textContent = 'Выполняется… Закройте Яндекс.Музыку, если ещё открыта.';
+      el.textContent = 'Выполняется…';
       try {
         const r = await fetch(API + path, {
           method: 'POST',
@@ -826,10 +826,8 @@
         } else {
           alert(
             path.indexOf('uninstall') >= 0
-              ? 'Мост удалён. Автоустановка отключена. Перезапустите Яндекс.Музыку.'
-              : (j.launchedYandexMusic
-                ? 'Мост установлен. Яндекс.Музыка запущена.'
-                : 'Мост установлен. Запустите Яндекс.Музыку.'),
+              ? 'Мост удалён. Автоустановка отключена.'
+              : 'Мост CDP установлен. Запускайте клиент ярлыком «Яндекс Музыка (RPC)» на рабочем столе.',
           );
         }
       } catch (e) {
@@ -842,13 +840,13 @@
     $('btn-bridge-install').addEventListener('click', () =>
       runBridgeAction(
         '/api/bridge/install',
-        'Установить мост в app.asar Яндекс.Музыки?\n\nЯндекс.Музыка будет принудительно закрыта.',
+        'Установить мост CDP?\n\nБудет создан ярлык «Яндекс Музыка (RPC)» с портом отладки 9229.\nСтарый asar-патч (если был) снимается.',
       ),
     );
     $('btn-bridge-uninstall').addEventListener('click', () =>
       runBridgeAction(
         '/api/bridge/uninstall',
-        'Удалить мост из Яндекс.Музыки?\n\nЯндекс.Музыка будет закрыта. Автоустановка отключится.',
+        'Удалить мост CDP?\n\nЯрлык/launcher будут сняты. Автоустановка отключится.',
       ),
     );
     $('btn-bridge-refresh').addEventListener('click', () => fetchBridgeStatus({ notify: true }));

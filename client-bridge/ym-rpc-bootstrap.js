@@ -1,7 +1,9 @@
 'use strict';
 /**
- * Точка входа вместо package.json main.
- * Оригинальный index.js не меняем — так надёжнее для Electron.
+ * Legacy asar entry (до YM 5.128).
+ * На 5.128+ правка app.asar/fuses ломает music-application://desktop —
+ * актуальный мост: CDP (--remote-debugging-port), см. scripts/install-client-bridge.js
+ * и lib/cdp-bridge.js. Этот файл оставлен для старых клиентов.
  */
 try {
   require('./ym-rpc-hook.js');

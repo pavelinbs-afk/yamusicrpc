@@ -1,6 +1,6 @@
 {
   "name": "yandex-music-discord-rpc",
-  "version": "2.3.0",
+  "version": "2.3.3",
   "description": "Официальное приложение RPC для статуса в Discord",
   "author": "Yandex Music RPC",
   "main": "electron/main.js",
@@ -19,7 +19,6 @@
   },
   "dependencies": {
     "@electron/asar": "^3.4.1",
-    "@electron/fuses": "1.8.0",
     "discord-rpc": "^2.2.8",
     "ws": "^8.18.0"
   },
@@ -62,7 +61,6 @@
       "scripts/install-client-bridge.js",
       "client-bridge/**/*",
       "node_modules/@electron/asar/**/*",
-      "node_modules/@electron/fuses/**/*",
       "electron/icon.ico"
     ],
     "win": {

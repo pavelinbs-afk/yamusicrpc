@@ -7,7 +7,7 @@
  * YM 5.128+: правка app.asar / flip Electron fuses ломает music-application://desktop
  * (ERR_FAILED −2, бесконечный relaunch). Поэтому:
  *  1) снимаем старый asar+fuses патч если был;
- *  2) ставим ярлык/launcher с --remote-debugging-port=9229;
+ *  2) launcher в %APPDATA% + автозапуск YM с --remote-debugging-port=9229;
  *  3) RPC читает плеер через CDP и шлёт source=client на /track.
  *
  * Usage:
@@ -166,25 +166,26 @@ function restoreLegacyAsarPatch(asarPath) {
   return restored;
 }
 
-/** Ярлык официальной Музыки с CDP — не путать с приложением Yandex Music RPC. */
-function desktopShortcutPath() {
-  return path.join(os.homedir(), 'Desktop', 'Яндекс.Музыка для Discord.lnk');
-}
-
-/** Старое имя ярлыка моста (путалось с Yandex Music RPC). */
-function legacyDesktopShortcutPaths() {
+/** Старые ярлыки моста на столе — только удаляем, больше не создаём. */
+function leftoverDesktopShortcutPaths() {
   return [
+    path.join(os.homedir(), 'Desktop', 'Яндекс.Музыка для Discord.lnk'),
     path.join(os.homedir(), 'Desktop', 'Яндекс Музыка (RPC).lnk'),
     path.join(os.homedir(), 'Desktop', 'Яндекс Музыка (RPC bridge).lnk'),
   ];
 }
 
-function removeLegacyYmRpcShortcuts() {
-  for (const p of legacyDesktopShortcutPaths()) {
+function removeDesktopShortcuts() {
+  const removed = [];
+  for (const p of leftoverDesktopShortcutPaths()) {
     try {
-      if (fs.existsSync(p)) fs.unlinkSync(p);
+      if (fs.existsSync(p)) {
+        fs.unlinkSync(p);
+        removed.push(p);
+      }
     } catch (_) {}
   }
+  return removed;
 }
 
 /** Есть ли уже процесс клиента (не наш RPC). */
@@ -211,7 +212,7 @@ function isCdpPortOpen() {
 }
 
 /**
- * Запуск клиента с --remote-debugging-port (как ярлык «Яндекс Музыка (RPC)»).
+ * Запуск клиента с --remote-debugging-port.
  * Кириллический путь — только через PowerShell EncodedCommand.
  * Важно: сбросить ELECTRON_RUN_AS_NODE — иначе YM наследует флаг от RPC-cli и не открывает GUI.
  */
@@ -253,10 +254,6 @@ function launchYandexMusicIfNeeded(asarPath) {
   if (!exePath) {
     return { ok: false, launchedYandexMusic: false, error: 'exe_not_found' };
   }
-  // Обновить ярлык, если пропал.
-  try {
-    if (!fs.existsSync(desktopShortcutPath())) createDesktopShortcut(exePath);
-  } catch (_) {}
   const launched = launchYandexMusic(exePath);
   return {
     ok: launched,
@@ -306,38 +303,13 @@ function writeLauncher(exePath) {
   return cmdPath;
 }
 
-/** Ярлык сразу на exe + аргумент порта — без .cmd (иначе cmd ломает UTF-8 кириллицу). */
-function createDesktopShortcut(exePath) {
-  if (process.platform !== 'win32') return null;
-  const lnk = desktopShortcutPath();
-  const ps =
-    `$ws = New-Object -ComObject WScript.Shell\n` +
-    `$s = $ws.CreateShortcut('${lnk.replace(/'/g, "''")}')\n` +
-    `$s.TargetPath = '${String(exePath).replace(/'/g, "''")}'\n` +
-    `$s.Arguments = '--remote-debugging-port=${CDP_PORT}'\n` +
-    `$s.WorkingDirectory = '${path.dirname(exePath).replace(/'/g, "''")}'\n` +
-    `$s.IconLocation = '${String(exePath).replace(/'/g, "''")},0'\n` +
-  `$s.Description = 'Официальная Яндекс.Музыка с портом для Yandex Music RPC'\n` +
-    `$s.Save()\n` +
-    `Write-Output 'ok'`;
-  const r = runPowerShellEncoded(ps, 20000);
-  if (r.status !== 0) {
-    try {
-      console.error('shortcut stderr:', (r.stderr || r.stdout || '').slice(0, 400));
-    } catch (_) {}
-    return null;
-  }
-  return lnk;
-}
-
 function install(asarPath) {
   const exePath = findYandexExe(asarPath);
   if (!exePath) throw new Error('Не найден exe Яндекс.Музыки');
 
   const legacy = restoreLegacyAsarPatch(asarPath);
   const launcher = writeLauncher(exePath);
-  removeLegacyYmRpcShortcuts();
-  const shortcut = createDesktopShortcut(exePath);
+  const removedShortcuts = removeDesktopShortcuts();
 
   return {
     ok: true,
@@ -347,11 +319,11 @@ function install(asarPath) {
     asarPath,
     exePath,
     launcher,
-    shortcut,
+    removedShortcuts,
     legacyRestored: legacy,
     message:
-      'Мост CDP установлен. На рабочем столе ярлык «Яндекс.Музыка для Discord» ' +
-      `(плеер с портом ${CDP_PORT}). Приложение статуса — из «Пуск»: Yandex Music RPC.`,
+      `Мост CDP установлен (порт ${CDP_PORT}). Ярлыки на стол не создаются — ` +
+      'Яндекс.Музыку при старте RPC открывает сам. Приложение статуса — из «Пуск».',
   };
 }
 
@@ -366,14 +338,7 @@ function uninstall(asarPath) {
       }
     } catch (_) {}
   }
-  for (const desk of [desktopShortcutPath(), ...legacyDesktopShortcutPaths()]) {
-    try {
-      if (fs.existsSync(desk)) {
-        fs.unlinkSync(desk);
-        removed.push(desk);
-      }
-    } catch (_) {}
-  }
+  removed.push(...removeDesktopShortcuts());
   return {
     ok: true,
     installed: false,
@@ -479,7 +444,6 @@ module.exports = {
   CDP_PORT,
   launcherCmdPath,
   launcherPs1Path,
-  desktopShortcutPath,
   launchYandexMusic,
   launchYandexMusicIfNeeded,
   restoreLegacyAsarPatch,

@@ -179,45 +179,6 @@ function legacyDesktopShortcutPaths() {
   ];
 }
 
-function rpcAppDesktopShortcutPath() {
-  return path.join(os.homedir(), 'Desktop', 'Yandex Music RPC.lnk');
-}
-
-function findRpcAppExe() {
-  if (process.platform === 'win32' && process.execPath) {
-    const base = path.basename(process.execPath);
-    if (/^Yandex Music RPC\.exe$/i.test(base) && fs.existsSync(process.execPath)) {
-      return process.execPath;
-    }
-  }
-  const local = process.env.LOCALAPPDATA || '';
-  if (local) {
-    const p = path.join(local, 'Programs', 'yandex-music-discord-rpc', 'Yandex Music RPC.exe');
-    if (fs.existsSync(p)) return p;
-  }
-  return null;
-}
-
-/** Ярлык самого приложения Discord RPC на рабочий стол. */
-function createRpcAppDesktopShortcut() {
-  if (process.platform !== 'win32') return null;
-  const exePath = findRpcAppExe();
-  if (!exePath) return null;
-  const lnk = rpcAppDesktopShortcutPath();
-  const ps =
-    `$ws = New-Object -ComObject WScript.Shell\n` +
-    `$s = $ws.CreateShortcut('${lnk.replace(/'/g, "''")}')\n` +
-    `$s.TargetPath = '${String(exePath).replace(/'/g, "''")}'\n` +
-    `$s.WorkingDirectory = '${path.dirname(exePath).replace(/'/g, "''")}'\n` +
-    `$s.IconLocation = '${String(exePath).replace(/'/g, "''")},0'\n` +
-    `$s.Description = 'Yandex Music RPC — статус в Discord'\n` +
-    `$s.Save()\n` +
-    `Write-Output 'ok'`;
-  const r = runPowerShellEncoded(ps, 20000);
-  if (r.status !== 0) return null;
-  return lnk;
-}
-
 function removeLegacyYmRpcShortcuts() {
   for (const p of legacyDesktopShortcutPaths()) {
     try {
@@ -377,7 +338,6 @@ function install(asarPath) {
   const launcher = writeLauncher(exePath);
   removeLegacyYmRpcShortcuts();
   const shortcut = createDesktopShortcut(exePath);
-  const rpcShortcut = createRpcAppDesktopShortcut();
 
   return {
     ok: true,
@@ -388,11 +348,10 @@ function install(asarPath) {
     exePath,
     launcher,
     shortcut,
-    rpcShortcut,
     legacyRestored: legacy,
     message:
-      'Мост CDP установлен. На рабочем столе: «Yandex Music RPC» (это приложение) и ' +
-      `«Яндекс.Музыка для Discord» (плеер с портом ${CDP_PORT}).`,
+      'Мост CDP установлен. На рабочем столе ярлык «Яндекс.Музыка для Discord» ' +
+      `(плеер с портом ${CDP_PORT}). Приложение статуса — из «Пуск»: Yandex Music RPC.`,
   };
 }
 
@@ -521,8 +480,6 @@ module.exports = {
   launcherCmdPath,
   launcherPs1Path,
   desktopShortcutPath,
-  rpcAppDesktopShortcutPath,
-  createRpcAppDesktopShortcut,
   launchYandexMusic,
   launchYandexMusicIfNeeded,
   restoreLegacyAsarPatch,

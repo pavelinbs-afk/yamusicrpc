@@ -101,9 +101,10 @@ ipcMain.handle('ym-rpc:set-expanded', (_e, expanded) => {
   const win = getSettingsWindow();
   if (!win || win.isDestroyed()) return;
   const b = win.getBounds();
-  const w = Math.max(b.width, 520);
-  const h = expanded ? 640 : 64;
-  win.setBounds({ x: b.x, y: b.y, width: w, height: h }, true);
+  const w = Math.max(b.width, 560);
+  // Окно всегда развёрнуто (кнопки «Настройки» больше нет); collapse только если явно false.
+  const h = expanded === false ? Math.max(b.height, 420) : Math.max(b.height, 640);
+  win.setBounds({ x: b.x, y: b.y, width: w, height: Math.max(h, 420) }, true);
 });
 
 ipcMain.handle('ym-rpc:hide-to-tray', () => {

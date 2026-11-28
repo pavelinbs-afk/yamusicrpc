@@ -77,7 +77,7 @@ function Get-MediaProps($session) {
   }
 }
 
-function Get-TimelineSeconds($session) {
+function Get-TimelineSeconds($session, [bool]$isPlaying) {
   $posSec = $null
   $durSec = $null
   try {
@@ -91,7 +91,21 @@ function Get-TimelineSeconds($session) {
       $durSec = [math]::Round([math]::Max(0, $spanDur.TotalSeconds), 3)
     }
     if ($durSec -and $spanPos.TotalSeconds -ge 0) {
-      $posSec = [math]::Round([math]::Min([math]::Max(0, $spanPos.TotalSeconds), $durSec), 3)
+      $posSec = [math]::Max(0, $spanPos.TotalSeconds)
+      # Position — снимок на LastUpdatedTime. YM почти не двигает Position (часто ~0),
+      # пока играет: добавляем возраст LastUpdatedTime, иначе Discord всегда с 0:00.
+      if ($isPlaying) {
+        try {
+          $lastUpdated = $tl.LastUpdatedTime
+          if ($null -ne $lastUpdated) {
+            $ageSec = ([DateTimeOffset]::Now - [DateTimeOffset]$lastUpdated).TotalSeconds
+            if ($ageSec -gt 0.05 -and $ageSec -lt 6 * 3600) {
+              $posSec = $posSec + $ageSec
+            }
+          }
+        } catch {}
+      }
+      $posSec = [math]::Round([math]::Min([math]::Max(0, $posSec), $durSec), 3)
     }
   } catch {}
   return @{ PositionSec = $posSec; DurationSec = $durSec }
@@ -178,7 +192,7 @@ if ($entries.Count -eq 0) {
 
 $pick = $entries | Sort-Object { $_.Rank } -Descending | Select-Object -First 1
 $props = $pick.Props
-$time = Get-TimelineSeconds $pick.Session
+$time = Get-TimelineSeconds $pick.Session (-not [bool]$pick.Paused)
 $coverPath = Save-ThumbnailToFile $props
 
 [PSCustomObject]@{

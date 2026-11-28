@@ -35,14 +35,14 @@ function createSettingsWindow() {
 
   const ver = typeof app.getVersion === 'function' ? app.getVersion() : '';
   const winOpts = {
-    width: 560,
-    height: 64,
-    minWidth: 480,
-    minHeight: 56,
-    maxHeight: 820,
+    width: 720,
+    height: 640,
+    minWidth: 560,
+    minHeight: 420,
+    maxHeight: 900,
     show: false,
     frame: false,
-    backgroundColor: '#0e0e10',
+    backgroundColor: '#000000',
     title: ver ? `Yandex Music RPC v${ver}` : 'Yandex Music RPC',
     titleBarStyle: 'hidden',
     skipTaskbar: false,

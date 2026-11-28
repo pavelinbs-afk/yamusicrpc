@@ -3335,6 +3335,15 @@ function runHttpServer() {
                   }
                   posSec = loopPos;
                   currentTrackStart = now - posSec * 1000;
+                } else if (!msg.paused) {
+                  /*
+                   * YM через GSMTC часто отдаёт Playing, но positionSec залипает (часто 0.0).
+                   * Раньше это считалось «паузой» → clearActivity через ~1с и статус пропадал.
+                   * Пока PlaybackStatus=Playing — крутим от wall-clock, presence не трогаем.
+                   */
+                  posSec = dur > 0
+                    ? Math.min(Math.max(0, expectedSec), dur)
+                    : Math.max(0, expectedSec);
                 } else {
                   posSec = raw;
                   gsmtcStalePaused = true;
